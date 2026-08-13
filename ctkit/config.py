@@ -61,11 +61,20 @@ class ProcessingConfig:
     clip_min: Optional[Number] = -200
     clip_max: Optional[Number] = 300
 
-    # ---- 4. resampling -------------------------------------------------
+    # ---- 4. crop to content --------------------------------------------
+    #: Crop away the air around the body. Only useful once intensities are
+    #: clipped, since the threshold below separates tissue from air.
+    crop_to_content: bool = False
+    #: Voxels above this are kept. ``None`` uses `clip_min` when clipping is
+    #: on, and the image minimum otherwise.
+    crop_content_threshold: Optional[Number] = None
+    crop_content_padding: int = 5
+
+    # ---- 5. resampling -------------------------------------------------
     resample: bool = True
     target_spacing: Sequence[Optional[Number]] = (0.8, 0.8, 3.0)
 
-    # ---- 5. slice selection (2D only) ----------------------------------
+    # ---- 6. slice selection (2D only) ----------------------------------
     dimensionality: Dimensionality = "3D"
     #: ``"mask"`` keeps the slice with the most mask, ``"index"`` the slice
     #: named by ``slice_index``.
@@ -76,18 +85,18 @@ class ProcessingConfig:
     slice_selection_label: Optional[Union[int, Sequence[int]]] = None
     slice_index: Optional[int] = None
 
-    # ---- 6. masking ----------------------------------------------------
+    # ---- 7. masking ----------------------------------------------------
     mask: bool = True
     mask_labels: Optional[Union[int, Sequence[int]]] = None
     crop_to_mask: bool = True
     crop_padding: int = 5
 
-    # ---- 7. size standardization ---------------------------------------
+    # ---- 8. size standardization ---------------------------------------
     standardize_size: bool = True
     target_shape: Optional[Sequence[Optional[int]]] = None
     shape_percentile: float = 95.0
 
-    # ---- 8. intensity normalization -------------------------------------
+    # ---- 9. intensity normalization -------------------------------------
     normalize: bool = False
     normalization_method: NormalizationMethod = "volume"
     dataset_mean: Optional[float] = None
@@ -352,6 +361,8 @@ class ProcessingConfig:
             enabled.append("segment")
         if self.clip:
             enabled.append("clip")
+        if self.crop_to_content:
+            enabled.append("crop_to_content")
         if self.resample:
             enabled.append("resample")
         if self.dimensionality == "2D":
@@ -363,6 +374,18 @@ class ProcessingConfig:
         if self.normalize:
             enabled.append("normalize")
         return enabled
+
+    @property
+    def resolved_crop_threshold(self) -> Optional[Number]:
+        """The threshold :meth:`~ctkit.RadiologyImage.crop_to_content` will use.
+
+        ``None`` means the image minimum, which only separates body from air
+        once intensities have been clipped — so when clipping is on, the clip
+        minimum is used, exactly as it is for the masking and padding fills.
+        """
+        if self.crop_content_threshold is not None:
+            return self.crop_content_threshold
+        return self.clip_min if self.clip else None
 
     @property
     def needs_dataset_pass(self) -> bool:
@@ -383,6 +406,12 @@ class ProcessingConfig:
                 f" (task={self.totalsegmentator_task})"
             ),
             "clip": f"clip intensities to [{self.clip_min}, {self.clip_max}] HU",
+            "crop_to_content": (
+                "crop to the voxels above "
+                + ("the image minimum" if self.resolved_crop_threshold is None
+                   else str(self.resolved_crop_threshold))
+                + f" with {self.crop_content_padding} voxel padding"
+            ),
             "resample": f"resample to {tuple(self.target_spacing)} mm voxels",
             "select_slice": (
                 f"keep axial slice {self.slice_index}"

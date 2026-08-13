@@ -685,6 +685,7 @@ class Dataset:
             orient=False,
             segment=False,
             clip=False,
+            crop_to_content=False,
             resample=False,
             mask=False,
             dimensionality="3D",  # the slice, if any, was already selected

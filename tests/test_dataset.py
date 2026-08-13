@@ -198,6 +198,18 @@ class TestCohortStatistics:
         assert {"series_id", "mean", "std", "shape"} <= set(frame.columns)
 
 
+class TestStagedSplit:
+    def test_per_image_steps_run_once_in_the_first_pass(self, cohort_dir):
+        """A cohort-level protocol must not repeat crop_to_content in the tail."""
+        config = ProcessingConfig(
+            segment=False, crop_to_content=True, standardize_size=True
+        )
+        head, tail = Dataset.from_directory(str(cohort_dir))._split_config(config)
+
+        assert "crop_to_content" in head.steps
+        assert "crop_to_content" not in tail.steps
+
+
 class TestProcess:
     def test_writes_only_final_files(self, cohort_dir, tmp_path):
         dataset = Dataset.from_directory(str(cohort_dir)).filter(LENIENT, progress=False)

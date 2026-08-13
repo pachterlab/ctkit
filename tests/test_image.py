@@ -286,6 +286,54 @@ class TestApplyMask:
         np.testing.assert_allclose(world_before, world_after, atol=1e-3)
 
 
+class TestCropToContent:
+    """The step is in the protocol, so a saved config describes it."""
+
+    @staticmethod
+    def _body_in_air(shape=(40, 40, 20)):
+        data = np.full(shape, -1000.0, dtype=np.float32)
+        data[10:30, 10:30, 5:15] = 60.0
+        return RadiologyImage(nib.Nifti1Image(data, np.eye(4)), series_id="synthetic")
+
+    def test_process_runs_it(self):
+        config = ProcessingConfig(
+            segment=False, mask=False, resample=False, standardize_size=False,
+            crop_to_content=True, crop_content_padding=2,
+        )
+        image = self._body_in_air().process(config)
+
+        assert image.shape == (24, 24, 14)  # the body, plus 2 voxels each side
+        assert image.applied_steps == ["orient", "clip", "crop_to_content"]
+
+    def test_it_runs_after_clipping(self):
+        """The default threshold is the clip minimum, so order is not incidental."""
+        config = ProcessingConfig(crop_to_content=True)
+        assert config.steps.index("crop_to_content") > config.steps.index("clip")
+        assert config.resolved_crop_threshold == config.clip_min
+
+    def test_an_explicit_threshold_wins(self):
+        config = ProcessingConfig(crop_to_content=True, crop_content_threshold=-500)
+        assert config.resolved_crop_threshold == -500
+
+    def test_without_clipping_it_warns_that_it_will_do_nothing(self, caplog):
+        config = ProcessingConfig(
+            clip=False, segment=False, mask=False, resample=False,
+            standardize_size=False, crop_to_content=True,
+        )
+        with caplog.at_level("WARNING"):
+            self._body_in_air().process(config)
+        assert "crop_content_threshold" in caplog.text
+
+    def test_it_appears_in_the_protocol_description(self):
+        described = ProcessingConfig(crop_to_content=True).describe()
+        assert "crop to the voxels above -200" in described
+
+    def test_it_survives_a_yaml_round_trip(self, tmp_path):
+        config = ProcessingConfig(crop_to_content=True, crop_content_threshold=-400)
+        config.to_yaml(str(tmp_path / "protocol.yaml"))
+        assert ProcessingConfig.from_yaml(str(tmp_path / "protocol.yaml")) == config
+
+
 class TestStandardizeSize:
     def test_pads_and_crops_to_target(self, image):
         image.standardize_size(64, 64, 10)

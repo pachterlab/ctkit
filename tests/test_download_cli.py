@@ -260,6 +260,27 @@ class TestCLI:
         written = ProcessingConfig.from_yaml(os.path.join(out_dir, "processing_config.yaml"))
         assert written.steps == ["orient"]
 
+    def test_crop_to_content_reaches_the_config(self):
+        args = cli._build_parser().parse_args(
+            ["process", "in", "--out", "out", "--crop-to-content"]
+        )
+        assert cli._config_from_args(args).crop_to_content is True
+
+    def test_a_crop_threshold_enables_the_step(self):
+        args = cli._build_parser().parse_args(
+            ["process", "in", "--out", "out", "--crop-threshold", "-500"]
+        )
+        config = cli._config_from_args(args)
+        assert config.crop_to_content
+        assert config.resolved_crop_threshold == -500
+
+    def test_a_crop_threshold_does_not_re_enable_a_skipped_step(self):
+        args = cli._build_parser().parse_args([
+            "process", "in", "--out", "out",
+            "--no-crop-to-content", "--crop-threshold", "-500",
+        ])
+        assert cli._config_from_args(args).crop_to_content is False
+
     def test_segmentation_dir_reaches_the_config(self, tmp_path):
         args = cli._build_parser().parse_args([
             "process", "in", "--out", "out",

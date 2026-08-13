@@ -701,6 +701,19 @@ class RadiologyImage:
         if config.clip:
             self.clip(config.clip_min, config.clip_max)
 
+        if config.crop_to_content:
+            if config.resolved_crop_threshold is None:
+                logger.warning(
+                    "%s: crop_to_content with no threshold and no clipping crops "
+                    "against the image minimum, which on raw HU is noise rather "
+                    "than air; set crop_content_threshold to a value in HU.",
+                    self.series_id or "image",
+                )
+            self.crop_to_content(
+                threshold=config.resolved_crop_threshold,
+                padding=config.crop_content_padding,
+            )
+
         if config.resample:
             self.resample(config.target_spacing)
 

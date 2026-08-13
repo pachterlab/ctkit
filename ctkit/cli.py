@@ -144,6 +144,7 @@ def _add_process_command(subparsers) -> None:
         ("orient", "reorient to canonical RAS"),
         ("segment", "segment organs with TotalSegmentator"),
         ("clip", "clip the intensity window"),
+        ("crop-to-content", "crop away the air around the body"),
         ("resample", "resample to a common voxel size"),
         ("mask", "mask and crop to the region of interest"),
         ("standardize-size", "crop/pad to a common array shape"),
@@ -156,6 +157,11 @@ def _add_process_command(subparsers) -> None:
                            help=f"skip: {help_text}")
 
     steps.add_argument("--clip-min", type=float, help="lower intensity bound (HU)")
+    steps.add_argument(
+        "--crop-threshold", type=float, metavar="HU",
+        help="keep voxels above this when cropping to content "
+             "(default: the clipping minimum)",
+    )
     steps.add_argument("--clip-max", type=float, help="upper intensity bound (HU)")
     steps.add_argument(
         "--spacing", nargs=3, type=float, metavar=("X", "Y", "Z"),
@@ -678,12 +684,13 @@ def _config_from_args(args):
         config = ProcessingConfig()
 
     overrides = {}
-    for name in ("orient", "segment", "clip", "resample", "mask", "normalize"):
+    for name in (
+        "orient", "segment", "clip", "crop_to_content", "resample", "mask",
+        "normalize", "standardize_size",
+    ):
         value = getattr(args, name, None)
         if value is not None:
             overrides[name] = value
-    if getattr(args, "standardize_size", None) is not None:
-        overrides["standardize_size"] = args.standardize_size
     if args.dimensionality:
         overrides["dimensionality"] = args.dimensionality
     if args.slice_mode:
@@ -697,6 +704,9 @@ def _config_from_args(args):
         )
     if args.clip_min is not None:
         overrides["clip_min"] = args.clip_min
+    if args.crop_threshold is not None:
+        overrides["crop_content_threshold"] = args.crop_threshold
+        overrides.setdefault("crop_to_content", True)
     if args.clip_max is not None:
         overrides["clip_max"] = args.clip_max
     if args.spacing:
