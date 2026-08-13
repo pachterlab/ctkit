@@ -67,6 +67,17 @@ the name of a collection whose curated protocol to use.
 package end to end: pick a collection, download it, filter it, process it, and
 extract features.
 
+[`notebooks/scanner_confounding.ipynb`](notebooks/scanner_confounding.ipynb) is
+the argument for the pipeline. A cohort is built on two scanners whose patient
+populations differ, so the scanner correlates with the label. A classifier
+trained on the raw volumes scores 0.89 on held-out data from the same study and
+0.58 at another hospital, and on that external set its answers agree with the
+*scanner* 88% of the time — it learned the machine, and internal validation
+could not tell. The same classifier on the same scans put through a `ctkit`
+protocol scores 0.96 externally. One ablation per step shows what each is
+worth, and what preprocessing cannot fix. Runs in a few minutes, no GPU or
+download needed.
+
 ## Relationship to tcia-radiology-processing
 
 This package grew out of the protocol in
