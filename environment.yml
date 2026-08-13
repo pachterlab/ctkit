@@ -1,0 +1,19 @@
+name: ctkit
+channels:
+  - conda-forge
+  - bioconda
+  - pytorch
+  - nvidia
+  - defaults
+dependencies:
+  - python==3.10
+  - pip
+  - tree
+  # dcm2niix handles more scanner quirks than the SimpleITK fallback used when
+  # it is absent. Optional, but recommended if you convert DICOM.
+  - dcm2niix
+  - pip:
+      # Installs the package with every optional extra (TotalSegmentator for
+      # organ segmentation, PyRadiomics for features, Jupyter widgets for
+      # interactive viewing). Use `pip install .` for the lighter base install.
+      - .[all]

@@ -1,0 +1,85 @@
+[build-system]
+requires = ["setuptools>=64", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "ctkit"
+version = "0.1.0"
+description = "A toolkit for reproducible CT image processing for AI and radiomics."
+readme = {file = "README.md", content-type = "text/markdown"}
+license = {file = "LICENSE"}
+authors = [
+    {name = "Joseph Rich", email = "josephrich98@gmail.com"}
+]
+maintainers = [
+    {name = "Joseph Rich", email = "josephrich98@gmail.com"}
+]
+requires-python = ">=3.10"
+keywords = [
+    "AI", "bioinformatics", "deep learning", "medicine", "radiology",
+    "radiomics", "CT", "DICOM", "NIfTI", "TCIA", "medical imaging"
+]
+classifiers = [
+    "Environment :: Console",
+    "Framework :: Jupyter",
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: BSD License",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+    "Topic :: Scientific/Engineering :: Bio-Informatics",
+    "Topic :: Scientific/Engineering :: Image Processing",
+    "Topic :: Scientific/Engineering :: Medical Science Apps.",
+    "Topic :: Utilities"
+]
+dependencies = [
+    "numpy",
+    "pandas",
+    "matplotlib",
+    "tqdm",
+    "requests",
+    "pydicom",
+    "highdicom",
+    "nibabel",
+    "scipy",
+    "simpleitk",
+    "pyyaml",
+    "openpyxl"
+]
+
+[project.optional-dependencies]
+# Organ segmentation. Pulls in torch, so it is kept out of the base install.
+segmentation = ["TotalSegmentator"]
+# Radiomic feature extraction.
+radiomics = ["pyradiomics"]
+# Interactive viewing inside Jupyter.
+notebook = ["ipython", "ipykernel", "ipywidgets"]
+# DICOM conversion via dcm2niix. Without it, SimpleITK is used instead.
+dicom = ["dcm2niix"]
+test = ["pytest"]
+all = [
+    "TotalSegmentator",
+    "pyradiomics",
+    "ipython",
+    "ipykernel",
+    "ipywidgets",
+    "dcm2niix",
+]
+
+[project.scripts]
+ctkit = "ctkit.cli:main"
+
+[project.urls]
+"Homepage" = "https://github.com/pachterlab/ctkit"
+"Source" = "https://github.com/pachterlab/ctkit"
+"Issues" = "https://github.com/pachterlab/ctkit/issues"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["ctkit*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+filterwarnings = ["ignore::DeprecationWarning"]
