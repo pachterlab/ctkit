@@ -16,6 +16,7 @@ from ctkit.io import (
     resolve_output_path,
     save_image,
 )
+from ctkit import qc
 from ctkit.qc import check_series_metadata, check_volume
 
 from .conftest import requires_radiomics
@@ -154,6 +155,48 @@ class TestQualityControl:
         assert check_series_metadata(row, QCCriteria())
         assert not check_series_metadata(row, QCCriteria.for_radiomics())
 
+    def test_keywords_match_whole_words(self):
+        """'cal' must not disqualify 'cervical' — the short keywords are abbreviations."""
+        row = {"SeriesDescription": "CERVICAL SPINE 2.0", "Modality": "CT",
+               "ImageCount": 200, "SliceThickness": 2.0}
+        assert check_series_metadata(row, QCCriteria())
+        assert not check_series_metadata(
+            {**row, "SeriesDescription": "CAL BODY"}, QCCriteria()
+        )
+
+    def test_check_merges_both_levels(self, volume):
+        row = {"SeriesDescription": "Topogram", "Modality": "CT", "ImageCount": 200}
+        result = qc.check(
+            volume[0], QCCriteria(min_slices=100), metadata=row, series_id="s1"
+        )
+        assert not result
+        assert "topogram" in result.reason and "slices" in result.reason
+        assert result.stats["n_slices"] == 20  # volume statistics are kept too
+
+    def test_check_without_a_volume_reads_no_pixels(self):
+        row = {"SeriesDescription": "ARTERIAL 2.0", "Modality": "CT", "ImageCount": 200}
+        assert qc.check(None, QCCriteria(), metadata=row)
+
+    def test_check_with_nothing_to_go_on_passes(self):
+        assert qc.check(None, QCCriteria(), series_id="s1")
+
+    def test_image_check_uses_its_metadata(self, volume):
+        image = RadiologyImage(
+            volume[0], series_id="s1",
+            metadata={"Modality": "MR", "SeriesDescription": "T2"},
+        )
+        assert not image.check(QCCriteria(min_slices=10))
+        assert image.check(QCCriteria(min_slices=10), level="volume")
+
+    def test_image_check_metadata_level_skips_the_volume(self, volume):
+        image = RadiologyImage(volume[0], metadata={"Modality": "CT"})
+        assert image.check(QCCriteria(min_slices=100), level="metadata")
+        assert not image.check(QCCriteria(min_slices=100), level="volume")
+
+    def test_image_check_rejects_an_unknown_level(self, volume):
+        with pytest.raises(ValueError, match="'metadata', 'volume' or 'all'"):
+            RadiologyImage(volume[0]).check(level="headers")
+
     def test_result_is_falsy_and_explains_itself(self):
         result = check_series_metadata(
             {"SeriesDescription": "scout", "Modality": "CT", "ImageCount": 1}, QCCriteria()
@@ -198,7 +241,7 @@ class TestIO:
         assert os.path.exists(path)
 
 
-class TestCatalogue:
+class TestCatalog:
     def test_lists_curated_and_extra_datasets(self):
         frame = list_datasets()
         assert "tcga-kirc" in set(frame["name"])

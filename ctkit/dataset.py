@@ -17,6 +17,7 @@ passes over the data when it has to.
 from __future__ import annotations
 
 import fnmatch
+import glob
 import logging
 import os
 from concurrent.futures import ProcessPoolExecutor, as_completed
@@ -25,9 +26,25 @@ from typing import Any, Callable, Iterable, Iterator, Optional, Sequence, Union
 import numpy as np
 
 from .config import ProcessingConfig
-from .image import RadiologyImage
-from .io import NIFTI_SUFFIXES
-from .qc import QCCriteria, QCResult, check_volume
+from .image import Number, RadiologyImage, _copy_nifti
+from .io import NIFTI_SUFFIXES, is_dicom_directory
+from .qc import QCCriteria, QCResult, resolve_criteria
+from .validation import (
+    CacheMode,
+    Integer,
+    Interpolator,
+    Labels,
+    Layout,
+    NormalizationMethod,
+    OutputFormat,
+    OnError,
+    PathArg,
+    QCLevel,
+    QCPreset,
+    SliceMode,
+    Spacing,
+    validate_class,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -44,16 +61,27 @@ DEFAULT_MASK_NAMES = (
 MASK_SUFFIXES = ("_mask", "_seg", "_segmentation", "_label", "_labels")
 
 
+@validate_class
 class Dataset:
-    """An ordered collection of :class:`RadiologyImage` objects.
+    """A cohort: an ordered collection of :class:`RadiologyImage` objects.
 
     Parameters
     ----------
     images:
-        ``RadiologyImage`` objects, or anything the constructor accepts
-        (paths, arrays, NIfTI images).
+        Where the cohort comes from. A directory is scanned for the layouts
+        :meth:`from_directory` recognizes, a ``.csv``/``.tsv`` is read as a
+        metadata table, a glob is expanded, and a list of paths, arrays or
+        images becomes exactly those series::
+
+            Dataset("data/raw")
+            Dataset("metadata.csv")
+            Dataset("data/raw/*/imaging.nii.gz")
+            Dataset(["a.nii.gz", "b.nii.gz"])
+
+        Use :meth:`from_directory` directly when a layout needs explicit
+        `image_pattern`/`mask_pattern` globs.
     name:
-        Optional label used in log messages.
+        Optional label used in log messages. Defaults to the directory name.
     lazy:
         Keep images unloaded until they are used. Leave this on for cohorts
         that do not fit in memory.
@@ -61,14 +89,53 @@ class Dataset:
 
     def __init__(
         self,
-        images: Iterable[Any],
+        images: Any,
         name: Optional[str] = None,
         lazy: bool = True,
+        **kwargs: Any,
     ) -> None:
+        if isinstance(images, (str, os.PathLike)):
+            discovered = self._from_source(str(images), name=name, **kwargs)
+            images, name = discovered.images, name or discovered.name
+        elif isinstance(images, Dataset):
+            images = list(images.images)
+        elif not isinstance(images, (list, tuple, set, Iterator)):
+            # A bare array or NIfTI image is one series, not an iterable of
+            # slices, and a string would iterate into characters.
+            images = [images]
+        elif kwargs:
+            images = [
+                item if isinstance(item, RadiologyImage) else RadiologyImage(item, **kwargs)
+                for item in images
+            ]
+
         self.name = name
         self.lazy = lazy
         self.images: list = [self._coerce(item, lazy) for item in images]
         self.qc_report = None
+        #: Images dropped by the most recent :meth:`filter` call.
+        self.rejected: list = []
+
+    @classmethod
+    def _from_source(cls, source: str, name: Optional[str] = None, **kwargs: Any) -> "Dataset":
+        """Discover a cohort from a path: a directory, a table, a glob, a file."""
+        if os.path.isdir(source):
+            if is_dicom_directory(source):  # one DICOM series, not a cohort
+                return cls([RadiologyImage(source, **kwargs)], name=name)
+            return cls.from_directory(source, name=name, **kwargs)
+        if source.lower().endswith((".csv", ".tsv")):
+            return cls.from_metadata(source, name=name)
+        if any(character in source for character in "*?["):
+            matches = sorted(glob.glob(source, recursive=True))
+            if not matches:
+                raise FileNotFoundError(f"No files match {source!r}")
+            return cls.from_paths(matches, name=name, **kwargs)
+        if not os.path.exists(source):
+            raise FileNotFoundError(
+                f"No such file or directory: {source}. A Dataset can be built from "
+                "a directory of cases, a metadata CSV, a glob, or a list of paths."
+            )
+        return cls([RadiologyImage(source, **kwargs)], name=name)
 
     @staticmethod
     def _coerce(item: Any, lazy: bool) -> RadiologyImage:
@@ -247,34 +314,50 @@ class Dataset:
     # ------------------------------------------------------------------
     def filter(
         self,
-        criteria: Optional[QCCriteria] = None,
+        criteria: Union[QCCriteria, QCPreset, None] = None,
+        level: QCLevel = "all",
         progress: bool = True,
         keep_report: bool = True,
+        **thresholds: Any,
     ) -> "Dataset":
         """Drop series that fail quality control, returning a new dataset.
 
+        `criteria` is a :class:`QCCriteria`, or the name of a preset
+        (``"default"``, ``"radiomics"``, ``"permissive"``). Individual
+        thresholds can be given as keywords instead: ``filter(min_slices=25)``.
+
+        `level` chooses which checks run: ``"metadata"`` reads no pixel data,
+        so it is the cheap first pass over a cohort that still has its headers
+        and metadata rows; ``"volume"`` checks the reconstructed volumes;
+        ``"all"`` (the default) does both.
+
         The full pass/fail table, including the measurements taken for series
         that passed, is left on :attr:`qc_report` of the returned dataset (and
-        of this one), so exclusions can be reported in a paper.
+        of this one), so exclusions can be reported in a paper. The images that
+        failed are kept on :attr:`rejected`, so they can be moved aside or
+        deleted afterwards.
         """
-        criteria = criteria or QCCriteria()
-        records, kept = [], []
+        criteria = resolve_criteria(criteria, **thresholds)
+        records, kept, rejected = [], [], []
 
         for image in _progress(self.images, "Quality control", progress):
             try:
-                result = check_volume(image.image, criteria, series_id=image.series_id)
+                result = image.check(criteria, level=level)
             except Exception as error:  # noqa: BLE001 - unreadable is a failure
                 result = QCResult(series_id=image.series_id).fail(f"failed to load: {error}")
             records.append(result.to_dict())
             if result.passed:
                 kept.append(image)
             else:
+                rejected.append(image)
                 logger.info("Excluding %s: %s", image.series_id, result.reason)
             if self.lazy and image.source is not None:
                 image.unload()
 
         report = _to_frame(records)
         filtered = Dataset(kept, name=self.name, lazy=self.lazy)
+        filtered.rejected = rejected
+        self.rejected = rejected
         if keep_report:
             self.qc_report = report
             filtered.qc_report = report
@@ -285,10 +368,162 @@ class Dataset:
         )
         return filtered
 
+    def check(
+        self,
+        criteria: Union[QCCriteria, QCPreset, None] = None,
+        level: QCLevel = "all",
+        progress: bool = True,
+        **thresholds: Any,
+    ):
+        """Run quality control over the cohort without dropping anything.
+
+        Returns the pass/fail table — every series, the outcome, the reason,
+        and the measurements behind it — as a DataFrame. Use :meth:`filter`
+        when you want the series that passed.
+        """
+        return self.filter(
+            criteria, level=level, progress=progress, **thresholds
+        ).qc_report
+
+    # ------------------------------------------------------------------
+    # processing steps, applied to every image
+    # ------------------------------------------------------------------
+    def orient(self, target: str = "RAS") -> "Dataset":
+        """Reorient every image. See :meth:`RadiologyImage.orient`."""
+        return self.apply("orient", target=target)
+
+    def segment(
+        self,
+        organs: Optional[Sequence[str]] = None,
+        task: str = "total",
+        tumor_mask: Optional[Any] = None,
+        restrict_organs_to_tumor: bool = True,
+        fast: bool = False,
+        remove_small_blobs: bool = True,
+        fill_holes: bool = True,
+        morphological_closing: bool = True,
+        device: Optional[str] = None,
+        output_dir: Optional[PathArg] = None,
+        replace: bool = False,
+    ) -> "Dataset":
+        """Segment every image. See :meth:`RadiologyImage.segment`.
+
+        `output_dir` keeps the TotalSegmentator files, one subdirectory per
+        series, so that the series do not overwrite each other.
+        """
+        options = dict(
+            organs=organs,
+            task=task,
+            tumor_mask=tumor_mask,
+            restrict_organs_to_tumor=restrict_organs_to_tumor,
+            fast=fast,
+            remove_small_blobs=remove_small_blobs,
+            fill_holes=fill_holes,
+            morphological_closing=morphological_closing,
+            device=device,
+            replace=replace,
+        )
+        if output_dir is None:
+            return self.apply("segment", **options)
+
+        root = os.fspath(output_dir)
+
+        def segment_one(image: RadiologyImage) -> None:
+            image.segment(
+                output_dir=os.path.join(root, image.series_id or "image"), **options
+            )
+
+        return self.apply(segment_one)
+
+    def clip(
+        self,
+        min_value: Optional[Number] = -200,
+        max_value: Optional[Number] = 300,
+    ) -> "Dataset":
+        """Clamp every image to an intensity window. See :meth:`RadiologyImage.clip`."""
+        return self.apply("clip", min_value=min_value, max_value=max_value)
+
+    def resample(
+        self,
+        spacing: Spacing = (0.8, 0.8, 3.0),
+        interpolator: Interpolator = "linear",
+    ) -> "Dataset":
+        """Resample every image. See :meth:`RadiologyImage.resample`."""
+        return self.apply("resample", spacing=spacing, interpolator=interpolator)
+
+    def select_slice(
+        self,
+        mode: SliceMode = "mask",
+        index: Optional[Integer] = None,
+        label: Optional[Labels] = None,
+        keepdims: bool = False,
+    ) -> "Dataset":
+        """Reduce every volume to one slice. See :meth:`RadiologyImage.select_slice`."""
+        return self.apply(
+            "select_slice", mode=mode, index=index, label=label, keepdims=keepdims
+        )
+
+    def apply_mask(
+        self,
+        labels: Optional[Labels] = None,
+        crop: bool = True,
+        padding: Integer = 5,
+        fill_value: Optional[Number] = None,
+    ) -> "Dataset":
+        """Mask and crop every image. See :meth:`RadiologyImage.apply_mask`."""
+        return self.apply(
+            "apply_mask", labels=labels, crop=crop, padding=padding, fill_value=fill_value
+        )
+
+    def crop_to_content(
+        self, threshold: Optional[Number] = None, padding: Integer = 5
+    ) -> "Dataset":
+        """Crop every image to its content. See :meth:`RadiologyImage.crop_to_content`."""
+        return self.apply("crop_to_content", threshold=threshold, padding=padding)
+
+    def standardize_size(
+        self,
+        x: Optional[Integer] = None,
+        y: Optional[Integer] = None,
+        z: Optional[Integer] = None,
+        fill_value: Optional[Number] = None,
+        mask_fill_value: Number = 0,
+    ) -> "Dataset":
+        """Crop/pad every image to a fixed shape. See :meth:`RadiologyImage.standardize_size`.
+
+        Unlike a protocol, this takes the shape you name; use
+        :meth:`shape_percentile` to measure one from the cohort first.
+        """
+        return self.apply(
+            "standardize_size",
+            x=x,
+            y=y,
+            z=z,
+            fill_value=fill_value,
+            mask_fill_value=mask_fill_value,
+        )
+
+    def normalize(
+        self,
+        method: NormalizationMethod = "volume",
+        mean: Optional[Number] = None,
+        std: Optional[Number] = None,
+        within_mask: bool = False,
+    ) -> "Dataset":
+        """Z-score every image. See :meth:`RadiologyImage.normalize`.
+
+        ``method="dataset"`` needs `mean` and `std` pooled over the cohort;
+        :meth:`intensity_statistics` measures them, and :meth:`process`
+        resolves them for you.
+        """
+        return self.apply(
+            "normalize", method=method, mean=mean, std=std, within_mask=within_mask
+        )
+
     # ------------------------------------------------------------------
     # cohort statistics
     # ------------------------------------------------------------------
-    def shape_percentile(self, percentile: float = 95.0, progress: bool = True) -> tuple:
+    def shape_percentile(self, percentile: Number = 95.0, progress: bool = True) -> tuple:
         """Per-axis percentile of the image shapes across the cohort.
 
         This is how a common output size is chosen: large enough to contain
@@ -458,15 +693,15 @@ class Dataset:
 
     def process(
         self,
-        config: Optional[ProcessingConfig] = None,
-        out_dir: Optional[str] = None,
-        workers: int = 1,
+        config: Optional[Any] = None,
+        out_dir: Optional[PathArg] = None,
+        workers: Integer = 1,
         progress: bool = True,
-        layout: str = "case_dirs",
+        layout: Layout = "case_dirs",
         skip_existing: bool = False,
-        on_error: str = "warn",
-        cache: str = "auto",
-        cache_dir: Optional[str] = None,
+        on_error: OnError = "warn",
+        cache: CacheMode = "auto",
+        cache_dir: Optional[PathArg] = None,
         **overrides: Any,
     ) -> "Dataset":
         """Run the protocol over the cohort.
@@ -474,7 +709,9 @@ class Dataset:
         Parameters
         ----------
         config:
-            The protocol. Defaults to :class:`ProcessingConfig` defaults.
+            The protocol: a :class:`ProcessingConfig`, the name of a collection
+            whose curated protocol to use, or a path to a saved YAML protocol.
+            Defaults to :class:`ProcessingConfig` defaults.
         out_dir:
             Where to write the processed images. Only the final image (and its
             mask) is written — no intermediate files. When omitted, results
@@ -508,17 +745,8 @@ class Dataset:
             The processed cohort. Backed by the written files when `out_dir`
             was given.
         """
-        config = (config or ProcessingConfig())
-        if overrides:
-            config = config.replace(**overrides)
+        config = ProcessingConfig.resolve(config, **overrides)
         config.validate()
-
-        if on_error not in ("warn", "raise"):
-            raise ValueError(f"on_error must be 'warn' or 'raise', got {on_error!r}")
-        if layout not in ("case_dirs", "flat"):
-            raise ValueError(f"layout must be 'case_dirs' or 'flat', got {layout!r}")
-        if cache not in ("auto", "disk", "none"):
-            raise ValueError(f"cache must be 'auto', 'disk' or 'none', got {cache!r}")
 
         if config.needs_dataset_pass:
             logger.info(
@@ -646,11 +874,18 @@ class Dataset:
     def _process_parallel(
         self, config, out_dir, workers, progress, layout, skip_existing, on_error
     ) -> list:
-        unpicklable = [image for image in self.images if image.source is None]
+        # Workers are handed a path and rebuild the image from it, so anything
+        # that is not fully described by its path has to stay in this process.
+        unpicklable = [
+            image
+            for image in self.images
+            if image.source is None or isinstance(image, _DeferredProxy)
+        ]
         if unpicklable:
             logger.warning(
-                "%d images hold in-memory data and cannot be sent to worker "
-                "processes; processing sequentially instead.", len(unpicklable),
+                "%d images hold in-memory data or a deferred step and cannot be "
+                "sent to worker processes; processing sequentially instead.",
+                len(unpicklable),
             )
             return self._process_sequential(
                 config, out_dir, progress, layout, skip_existing, on_error
@@ -719,11 +954,11 @@ class Dataset:
     # ------------------------------------------------------------------
     def radiomics(
         self,
-        labels: Sequence[int] = (1, 2),
+        labels: Labels = (1, 2),
         params: Optional[Union[str, dict]] = None,
-        out_csv: Optional[str] = None,
+        out_csv: Optional[PathArg] = None,
         progress: bool = True,
-        on_error: str = "warn",
+        on_error: OnError = "warn",
     ):
         """Extract radiomic features for every series, as a DataFrame."""
         from .features import extract_features
@@ -752,6 +987,39 @@ class Dataset:
     # ------------------------------------------------------------------
     # misc
     # ------------------------------------------------------------------
+    def apply(self, step: Union[str, Callable], *args: Any, **kwargs: Any) -> "Dataset":
+        """Apply one processing step to every image, returning a new dataset.
+
+        `step` is the name of a :class:`RadiologyImage` method (``"orient"``,
+        ``"clip"``, ...) or a callable taking an image.
+
+        For images backed by a path the step is *deferred*: it is recorded now
+        and run as each image is read, so a cohort that does not fit in memory
+        still works and repeated calls compose into a single pass. Images that
+        are already in memory have nowhere to be re-read from, so the step is
+        applied to them immediately, in place.
+        """
+        if not callable(step) and not callable(getattr(RadiologyImage, str(step), None)):
+            raise AttributeError(
+                f"{step!r} is not a RadiologyImage method. Available steps: "
+                "orient, segment, clip, resample, select_slice, apply_mask, "
+                "crop_to_content, standardize_size, normalize."
+            )
+
+        def run(image: RadiologyImage) -> None:
+            if callable(step):
+                step(image)
+            else:
+                getattr(image, step)(*args, **kwargs)
+
+        images = [
+            _DeferredProxy(image, run) if image.source is not None else _in_place(image, run)
+            for image in self.images
+        ]
+        applied = Dataset(images, name=self.name, lazy=self.lazy)
+        applied.qc_report = self.qc_report
+        return applied
+
     def map(
         self, function: Callable[[RadiologyImage], Any], progress: bool = True
     ) -> list:
@@ -765,9 +1033,9 @@ class Dataset:
 
     def save(
         self,
-        out_dir: str,
-        layout: str = "case_dirs",
-        output_format: str = "nifti",
+        out_dir: PathArg,
+        layout: Layout = "case_dirs",
+        output_format: OutputFormat = "nifti",
         compress: bool = True,
         progress: bool = True,
     ) -> "Dataset":
@@ -802,15 +1070,21 @@ class _ProcessedView(Dataset):
         self.name = source.name
         self.lazy = True
         self.qc_report = None
+        self.rejected = []
         self.images = [_ProcessedProxy(image, config) for image in source.images]
 
 
-class _ProcessedProxy(RadiologyImage):
-    """A :class:`RadiologyImage` that runs a config the first time it loads."""
+class _DeferredProxy(RadiologyImage):
+    """A :class:`RadiologyImage` that runs `apply` the first time it loads.
 
-    def __init__(self, source_image: RadiologyImage, config: ProcessingConfig):
+    This is what lets a step be recorded against a cohort without reading it:
+    the work happens when the image is next needed, and unloading throws it
+    away again, so only one image is ever in memory.
+    """
+
+    def __init__(self, source_image: RadiologyImage, apply: Callable[[RadiologyImage], Any]):
         self._source_image = source_image
-        self._config = config
+        self._apply = apply
         super().__init__(
             source_image.source if source_image.source is not None else np.zeros((1, 1, 1)),
             mask=source_image.mask_source,
@@ -827,14 +1101,24 @@ class _ProcessedProxy(RadiologyImage):
 
     def load(self) -> "RadiologyImage":
         if not self._loaded:
-            if self._source_image.source is not None:
+            source = self._source_image
+            if source.source is not None and not isinstance(source, _DeferredProxy):
                 super().load()
             else:
-                original = self._source_image.copy()
-                self._image = original._image
-                self._mask = original._mask
+                # Read through the source itself, so a step it is deferring in
+                # turn runs before this one. Its pixels are copied rather than
+                # shared, so the chain does not mutate what it reads from.
+                was_loaded = source._loaded
+                source.load()
+                self._image = _copy_nifti(source._image)
+                self._mask = _copy_nifti(source._mask)
                 self._loaded = True
-            super().process(self._config)
+                self.metadata.update(source.metadata)
+                # Carry the provenance of the steps that ran before this one.
+                self.history = list(source.history) + self.history
+                if not was_loaded and source.source is not None:
+                    source.unload()
+            self._apply(self)
         return self
 
     def unload(self) -> "RadiologyImage":
@@ -843,6 +1127,20 @@ class _ProcessedProxy(RadiologyImage):
         self._loaded = False
         self.history = []
         return self
+
+
+class _ProcessedProxy(_DeferredProxy):
+    """A :class:`RadiologyImage` that runs a config the first time it loads."""
+
+    def __init__(self, source_image: RadiologyImage, config: ProcessingConfig):
+        self._config = config
+        super().__init__(source_image, lambda image: image.process(config))
+
+
+def _in_place(image: RadiologyImage, run: Callable[[RadiologyImage], Any]) -> RadiologyImage:
+    """Run a step now, for an image that cannot be re-read from disk."""
+    run(image)
+    return image
 
 
 # ----------------------------------------------------------------------
@@ -911,6 +1209,77 @@ def _process_payload(payload: dict) -> dict:
             if isinstance(value, (str, int, float, bool, type(None)))
         },
     }
+
+
+# ----------------------------------------------------------------------
+# disposing of rejected series
+# ----------------------------------------------------------------------
+def files_of(image: RadiologyImage) -> list:
+    """The files on disk that belong to `image`, as paths.
+
+    A case directory named after the series (the layout this package writes,
+    and the one TCIA conversions produce) counts as one unit, so its mask and
+    any sidecar files travel with the image. Images that were never read from
+    disk have no files.
+    """
+    if image.source is None:
+        return []
+
+    source = os.path.abspath(str(image.source))
+    parent = os.path.dirname(source)
+    if os.path.isdir(source):
+        return [source]
+    if image.series_id and os.path.basename(parent) == image.series_id:
+        return [parent]
+
+    paths = [source]
+    if image.mask_source is not None:
+        paths.append(os.path.abspath(str(image.mask_source)))
+    return paths
+
+
+def discard(
+    images: Iterable[RadiologyImage],
+    destination: Optional[str] = None,
+    delete: bool = False,
+) -> list:
+    """Move the files of `images` to `destination`, or delete them.
+
+    This is the destructive half of quality control: once a series is excluded,
+    its files are usually in the way. Moving is the reversible option; `delete`
+    has to be asked for explicitly. Returns the paths acted on.
+    """
+    import shutil
+
+    if delete == bool(destination):
+        raise ValueError("discard() takes either a destination or delete=True")
+
+    if destination:
+        os.makedirs(destination, exist_ok=True)
+
+    acted: list = []
+    for image in images:
+        for path in files_of(image):
+            if not os.path.exists(path):
+                continue
+            if delete:
+                if os.path.isdir(path):
+                    shutil.rmtree(path, ignore_errors=True)
+                else:
+                    os.remove(path)
+            else:
+                target = os.path.join(destination, os.path.basename(path))
+                if os.path.exists(target):
+                    logger.warning("%s already exists; leaving %s in place.", target, path)
+                    continue
+                shutil.move(path, target)
+            acted.append(path)
+
+    logger.info(
+        "%s %d paths from the series that failed quality control.",
+        "Deleted" if delete else f"Moved to {destination}:", len(acted),
+    )
+    return acted
 
 
 # ----------------------------------------------------------------------

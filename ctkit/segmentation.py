@@ -2,17 +2,8 @@
 
 TotalSegmentator is a command line tool that reads and writes files, so it is
 run inside a temporary directory that is deleted as soon as the masks are in
-memory. Nothing is left on disk.
-
-Label convention used throughout this package:
-
-===== ==========
-value meaning
-===== ==========
-0     background
-1     organ
-2     tumor
-===== ==========
+memory. Nothing is left on disk unless `output_dir` names somewhere to keep the
+segmentation files.
 """
 
 from __future__ import annotations
@@ -30,8 +21,9 @@ import scipy.ndimage as ndi
 
 logger = logging.getLogger(__name__)
 
+#: The label convention used throughout the package: 0 background, 1 organ,
+#: 2 tumor. Where they overlap, tumor wins.
 BACKGROUND, ORGAN, TUMOR = 0, 1, 2
-LABEL_NAMES = {BACKGROUND: "background", ORGAN: "organ", TUMOR: "tumor"}
 
 
 class TotalSegmentatorNotFound(RuntimeError):
@@ -52,6 +44,7 @@ def segment_organs(
     morphological_closing: bool = True,
     device: Optional[str] = None,
     modality: str = "CT",
+    output_dir: Optional[str] = None,
     extra_args: Optional[Sequence[str]] = None,
 ) -> nib.Nifti1Image:
     """Segment `organs` with TotalSegmentator and return their union as a mask.
@@ -69,6 +62,7 @@ def segment_organs(
         morphological_closing=morphological_closing,
         device=device,
         modality=modality,
+        output_dir=output_dir,
         extra_args=extra_args,
     )
     return combine_organ_masks(list(components.values()))
@@ -84,6 +78,7 @@ def segment_organ_components(
     morphological_closing: bool = True,
     device: Optional[str] = None,
     modality: str = "CT",
+    output_dir: Optional[str] = None,
     extra_args: Optional[Sequence[str]] = None,
 ) -> dict:
     """Segment `organs` and return one binary mask per structure.
@@ -102,6 +97,14 @@ def segment_organ_components(
     fill_holes, morphological_closing:
         Applied slice-by-slice to each structure, to close the small gaps the
         network leaves at organ boundaries.
+    output_dir:
+        Where TotalSegmentator writes its NIfTI files. By default a temporary
+        directory that is deleted once the masks are in memory; give a path to
+        keep them. It is created if it does not exist, and files with the same
+        names are overwritten; one that survives the run is reported as
+        possibly stale rather than silently read back. The returned masks are
+        the same either way — note that they are cleaned in memory, so the
+        files on disk are the raw network output.
 
     Returns
     -------
@@ -123,13 +126,26 @@ def segment_organ_components(
 
     with tempfile.TemporaryDirectory(prefix="ctkit_seg_") as tmp:
         image_path = os.path.join(tmp, "input.nii.gz")
-        output_dir = os.path.join(tmp, "segmentations")
+        if output_dir is None:
+            segmentation_dir = os.path.join(tmp, "segmentations")
+        else:
+            segmentation_dir = os.fspath(output_dir)
+            os.makedirs(segmentation_dir, exist_ok=True)
         nib.save(image, image_path)
+
+        # A reused output directory can already hold masks under the names this
+        # run writes; anything the run does not touch would be read back as if
+        # it belonged to this image, so keep the timestamps to check against.
+        existing = {}
+        for organ in organs:
+            path = os.path.join(segmentation_dir, f"{organ}.nii.gz")
+            if os.path.exists(path):
+                existing[organ] = os.path.getmtime(path)
 
         command = [
             "TotalSegmentator",
             "-i", image_path,
-            "-o", output_dir,
+            "-o", segmentation_dir,
             "--task", task,
         ]
         # Asking for only the structures we need saves a large amount of time
@@ -155,9 +171,12 @@ def segment_organ_components(
                 f"(exit {completed.returncode}).\n{completed.stderr.strip()[-2000:]}"
             )
 
+        if output_dir is not None:
+            logger.info("Segmentation files kept in %s", segmentation_dir)
+
         masks = {}
         for organ in organs:
-            path = os.path.join(output_dir, f"{organ}.nii.gz")
+            path = os.path.join(segmentation_dir, f"{organ}.nii.gz")
             if not os.path.exists(path):
                 logger.warning(
                     "TotalSegmentator produced no mask for %r (task=%s). "
@@ -165,6 +184,12 @@ def segment_organ_components(
                     organ, task,
                 )
                 continue
+            if existing.get(organ) == os.path.getmtime(path):
+                logger.warning(
+                    "%s was already in %s and this run did not rewrite it; "
+                    "it may be left over from a different image.",
+                    os.path.basename(path), segmentation_dir,
+                )
             organ_image = nib.load(path)
             masks[organ] = nib.Nifti1Image(
                 np.asanyarray(organ_image.dataobj), organ_image.affine, organ_image.header
@@ -251,7 +276,7 @@ def combine_organ_and_tumor(
     restrict_organs_to_tumor: bool = True,
     organ_components: Optional[dict] = None,
 ) -> nib.Nifti1Image:
-    """Merge an organ mask and a tumor mask into one labelled mask.
+    """Merge an organ mask and a tumor mask into one labeled mask.
 
     Organ voxels become 1 and tumor voxels 2; where they overlap, tumor wins.
 
@@ -299,7 +324,7 @@ def binarize_masked_image(
     label: int = TUMOR,
     tolerance: float = 1e-5,
 ) -> nib.Nifti1Image:
-    """Recover a mask from an image that was *masked* rather than labelled.
+    """Recover a mask from an image that was *masked* rather than labeled.
 
     Some archives distribute a "ROI" volume that holds the original intensities
     inside the region of interest and the image minimum (air) everywhere else.
@@ -314,7 +339,7 @@ def binarize_masked_image(
 def resample_mask_to(
     mask: nib.Nifti1Image, reference: nib.Nifti1Image
 ) -> nib.Nifti1Image:
-    """Put `mask` on the voxel grid of `reference` with nearest-neighbour."""
+    """Put `mask` on the voxel grid of `reference` with nearest-neighbor."""
     import SimpleITK as sitk
 
     from .io import nifti_to_sitk, sitk_to_nifti

@@ -23,13 +23,13 @@ def make_volume(
     """
     rng = np.random.default_rng(seed)
     grid = np.meshgrid(*[np.arange(size) for size in shape], indexing="ij")
-    centre = [size // 2 for size in shape]
+    center = [size // 2 for size in shape]
     radius = min(shape[0], shape[1]) // 4
 
     distance = (
-        (grid[0] - centre[0]) ** 2
-        + (grid[1] - centre[1]) ** 2
-        + ((grid[2] - centre[2]) * 3) ** 2
+        (grid[0] - center[0]) ** 2
+        + (grid[1] - center[1]) ** 2
+        + ((grid[2] - center[2]) * 3) ** 2
     )
     organ = distance < radius ** 2
     tumor = distance < (radius // 2) ** 2

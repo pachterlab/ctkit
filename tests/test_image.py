@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+import os
+import subprocess
+
 import nibabel as nib
 import numpy as np
 import pytest
@@ -79,7 +82,7 @@ class TestOrient:
     def test_preserves_world_coordinates(self, image):
         """Reorienting relabels the axes; it must not move the anatomy.
 
-        The tumour's centre of mass is used as the landmark because it is
+        The tumor's center of mass is used as the landmark because it is
         independent of the voxel storage order.
         """
         from scipy.ndimage import center_of_mass
@@ -109,6 +112,103 @@ class TestClip:
     def test_requires_a_bound(self, image):
         with pytest.raises(ValueError, match="needs min_value"):
             image.clip(None, None)
+
+
+class TestSegment:
+    """TotalSegmentator is faked: the point is the file handling around it."""
+
+    @pytest.fixture
+    def fake_totalsegmentator(self, monkeypatch, volume):
+        """Stand in for the executable, writing one mask per requested organ."""
+        from ctkit import segmentation as seg
+
+        data, _ = volume
+        calls = []
+
+        def run(command, **_):
+            calls.append(list(command))
+            output_dir = command[command.index("-o") + 1]
+            os.makedirs(output_dir, exist_ok=True)
+            organs = command[command.index("--roi_subset") + 1:]
+            sphere = (np.asanyarray(data.dataobj) > 0).astype(np.uint8)
+            for organ in organs:
+                nib.save(
+                    nib.Nifti1Image(sphere, data.affine),
+                    os.path.join(output_dir, f"{organ}.nii.gz"),
+                )
+            return subprocess.CompletedProcess(command, 0, "", "")
+
+        monkeypatch.setattr(seg, "totalsegmentator_available", lambda: True)
+        monkeypatch.setattr(seg.subprocess, "run", run)
+        return calls
+
+    def test_writes_nothing_by_default(self, fake_totalsegmentator, image):
+        image.segment(organs=["kidney_left"], replace=True)
+        assert image.has_mask
+        output_dir = fake_totalsegmentator[0][fake_totalsegmentator[0].index("-o") + 1]
+        assert not os.path.exists(output_dir)
+
+    def test_output_dir_keeps_the_files(self, fake_totalsegmentator, image, tmp_path):
+        destination = tmp_path / "segmentations"
+        image.segment(organs=["kidney_left"], output_dir=str(destination), replace=True)
+        assert (destination / "kidney_left.nii.gz").exists()
+
+    def test_output_dir_is_created(self, fake_totalsegmentator, image, tmp_path):
+        destination = tmp_path / "nested" / "segmentations"
+        image.segment(organs=["kidney_left"], output_dir=destination, replace=True)
+        assert (destination / "kidney_left.nii.gz").exists()
+
+    def test_warns_about_a_file_the_run_did_not_rewrite(
+        self, monkeypatch, image, tmp_path, caplog, volume
+    ):
+        from ctkit import segmentation as seg
+
+        destination = tmp_path / "segmentations"
+        destination.mkdir()
+        data, _ = volume
+        nib.save(data, str(destination / "kidney_left.nii.gz"))  # left over
+
+        monkeypatch.setattr(seg, "totalsegmentator_available", lambda: True)
+        monkeypatch.setattr(
+            seg.subprocess,
+            "run",
+            lambda command, **_: subprocess.CompletedProcess(command, 0, "", ""),
+        )
+
+        with caplog.at_level("WARNING"):
+            image.segment(
+                organs=["kidney_left"], output_dir=str(destination), replace=True
+            )
+        assert "may be left over" in caplog.text
+
+    def test_config_segmentation_dir_is_per_series(
+        self, fake_totalsegmentator, image, tmp_path
+    ):
+        destination = tmp_path / "segmentations"
+        image.process(
+            ProcessingConfig(
+                segment=True,
+                organs=["kidney_left"],
+                segmentation_dir=str(destination),
+                standardize_size=False,
+            )
+        )
+        assert (destination / "synthetic" / "kidney_left.nii.gz").exists()
+
+    def test_cohort_gets_one_directory_per_series(
+        self, fake_totalsegmentator, cohort_dir, tmp_path
+    ):
+        from ctkit import Dataset
+
+        destination = tmp_path / "segmentations"
+        data = Dataset(str(cohort_dir)).segment(
+            organs=["kidney_left"], output_dir=str(destination), replace=True
+        )
+        series_ids = []
+        for image in data:
+            image.shape  # touching the data is what runs the deferred step
+            series_ids.append(image.series_id)
+        assert sorted(os.listdir(destination)) == sorted(series_ids)
 
 
 class TestResample:
@@ -197,8 +297,8 @@ class TestStandardizeSize:
         image.standardize_size(30, 30, None)
         assert image.shape == (30, 30, depth)
 
-    def test_keeps_the_centre(self, image):
-        """Centre-cropping must keep the tumour, which sits at the centre."""
+    def test_keeps_the_center(self, image):
+        """Center-cropping must keep the tumor, which sits at the center."""
         image.standardize_size(30, 30, 12)
         assert (image.mask_array == 2).any()
 
@@ -230,31 +330,93 @@ class TestNormalize:
             image.normalize()
 
 
-class TestSelectBestSlice:
+class TestSelectSlice:
     def test_reduces_to_two_dimensions(self, image):
-        image.select_best_slice(label=2)
+        image.select_slice(label=2)
         assert image.ndim == 2
         assert image.mask.shape == image.shape
 
     def test_picks_the_slice_with_most_label(self, image):
         counts = (image.mask_array == 2).sum(axis=(0, 1))
         expected = int(np.argmax(counts))
-        image.select_best_slice(label=2)
-        assert image.metadata["slice_with_most_label_2"] == expected
-        assert image.metadata["n_label_2_voxels_in_slice"] == int(counts[expected])
+        image.select_slice(label=2)
+        assert image.metadata["selected_slice"] == expected
+        assert image.metadata["selected_slice_mask_voxels"] == int(counts[expected])
+
+    def test_measures_several_labels_together(self, image):
+        counts = np.isin(image.mask_array, [1, 2]).sum(axis=(0, 1))
+        image.select_slice(label=[1, 2])
+        assert image.metadata["selected_slice"] == int(np.argmax(counts))
 
     def test_missing_label_falls_back_to_slice_zero(self, image):
-        image.select_best_slice(label=7)
-        assert image.metadata["n_label_7_voxels_in_slice"] == 0
+        image.select_slice(label=7)
+        assert image.metadata["selected_slice"] == 0
+        assert image.metadata["selected_slice_mask_voxels"] == 0
         assert image.ndim == 2
 
     def test_keepdims(self, image):
-        image.select_best_slice(label=2, keepdims=True)
+        image.select_slice(label=2, keepdims=True)
         assert image.ndim == 3 and image.shape[2] == 1
 
-    def test_requires_a_mask(self, volume):
+    def test_mask_mode_requires_a_mask(self, volume):
         with pytest.raises(ValueError, match="needs a mask"):
-            RadiologyImage(volume[0]).select_best_slice()
+            RadiologyImage(volume[0]).select_slice()
+
+
+class TestSelectSliceLabelDefault:
+    """With no label given, a binary mask is unambiguous and a multi-label one is not."""
+
+    def test_binary_mask_uses_its_only_label(self, volume):
+        data, mask = volume
+        binary = nib.Nifti1Image(
+            (np.asanyarray(mask.dataobj) > 0).astype(np.uint8), mask.affine
+        )
+        image = RadiologyImage(data, mask=binary)
+        counts = (np.asanyarray(binary.dataobj) == 1).sum(axis=(0, 1))
+
+        image.select_slice()
+        assert image.metadata["selected_slice_label"] == 1
+        assert image.metadata["selected_slice"] == int(np.argmax(counts))
+
+    def test_multi_label_mask_asks_for_a_label(self, image):
+        with pytest.raises(ValueError, match="several labels"):
+            image.select_slice()
+
+    def test_empty_mask_keeps_slice_zero(self, volume):
+        data, mask = volume
+        empty = nib.Nifti1Image(np.zeros(mask.shape, dtype=np.uint8), mask.affine)
+        image = RadiologyImage(data, mask=empty).select_slice()
+        assert image.metadata["selected_slice"] == 0
+        assert image.ndim == 2
+
+
+class TestSelectSliceByIndex:
+    def test_keeps_the_requested_slice(self, image):
+        expected = image.array[:, :, 5].copy()
+        image.select_slice(mode="index", index=5)
+        assert image.metadata["selected_slice"] == 5
+        np.testing.assert_array_equal(image.array, expected)
+
+    def test_negative_index_counts_from_the_end(self, image):
+        last = image.shape[2] - 1
+        image.select_slice(mode="index", index=-1)
+        assert image.metadata["selected_slice"] == last
+
+    def test_needs_an_index(self, image):
+        with pytest.raises(ValueError, match="needs index"):
+            image.select_slice(mode="index")
+
+    def test_rejects_an_out_of_range_index(self, image):
+        with pytest.raises(IndexError, match="out of range"):
+            image.select_slice(mode="index", index=999)
+
+    def test_needs_no_mask(self, volume):
+        image = RadiologyImage(volume[0]).select_slice(mode="index", index=3)
+        assert image.ndim == 2
+
+    def test_rejects_an_unknown_mode(self, image):
+        with pytest.raises(ValueError, match="'mask' or 'index'"):
+            image.select_slice(mode="tumor")
 
 
 class TestProcess:
@@ -290,8 +452,17 @@ class TestProcess:
 
     def test_two_dimensional_output_needs_a_mask(self, volume):
         image = RadiologyImage(volume[0])
-        with pytest.raises(ValueError, match="2D output requires a mask"):
+        with pytest.raises(ValueError, match="requires a mask"):
             image.process(ProcessingConfig(segment=False, dimensionality="2D"))
+
+    def test_two_dimensional_output_by_index_needs_no_mask(self, volume):
+        image = RadiologyImage(volume[0])
+        image.process(ProcessingConfig(
+            segment=False, dimensionality="2D", slice_selection_mode="index",
+            slice_index=4, mask=False, standardize_size=False,
+        ))
+        assert image.ndim == 2
+        assert image.metadata["selected_slice"] == 4
 
 
 class TestSaveAndCopy:

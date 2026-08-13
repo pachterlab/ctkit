@@ -10,7 +10,7 @@ converted volume is kept, so a collection lands on disk as
     out_dir/<series_id>/imaging.nii.gz
 
 Collections with restricted access still need the NBIA Data Retriever and a
-signed licence; :func:`download_with_nbia_retriever` wraps that path.
+signed license; :func:`download_with_nbia_retriever` wraps that path.
 """
 
 from __future__ import annotations
@@ -182,7 +182,7 @@ def download(
     Parameters
     ----------
     dataset:
-        A catalogue name (``"tcga-kirc"``) or any TCIA collection name
+        A catalog name (``"tcga-kirc"``) or any TCIA collection name
         (``"NSCLC-Radiomics"``).
     out_dir:
         Destination. Each series becomes ``out_dir/<series_id>/imaging.nii.gz``.
@@ -358,7 +358,7 @@ def download_with_nbia_retriever(
     manifest: str,
     out_dir: str,
     executable: str = "nbia-data-retriever",
-    accept_licence: bool = False,
+    accept_license: bool = False,
 ) -> str:
     """Download from a ``.tcia`` manifest using the NBIA Data Retriever.
 
@@ -376,7 +376,7 @@ def download_with_nbia_retriever(
 
     os.makedirs(out_dir, exist_ok=True)
     command = f"{executable} --cli {manifest} -d {out_dir} -v -f"
-    if accept_licence:
+    if accept_license:
         command = "yes 'Y\nM' | " + command
     logger.info("Running: %s", command)
     subprocess.run(command, shell=True, check=True)

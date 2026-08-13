@@ -34,12 +34,25 @@ from .io import (
     save_image,
     sitk_to_nifti,
 )
+from .validation import (
+    Integer,
+    Interpolator,
+    Labels,
+    NormalizationMethod,
+    Number,
+    OutputFormat,
+    PathArg,
+    QCLevel,
+    QCPreset,
+    SliceMode,
+    Spacing,
+    validate_class,
+)
 
 logger = logging.getLogger(__name__)
 
-Number = Union[int, float]
 
-
+@validate_class
 class RadiologyImage:
     """A single radiology image, optionally paired with a segmentation mask.
 
@@ -50,7 +63,7 @@ class RadiologyImage:
         already-loaded ``Nifti1Image`` / ``SimpleITK.Image`` / ``ndarray``.
     mask:
         Optional segmentation in any of the same forms. By convention 1 is
-        organ and 2 is tumor, but any labelling works as long as you pass the
+        organ and 2 is tumor, but any labeling works as long as you pass the
         matching ``labels`` to the steps that use it.
     series_id:
         Identifier used in reports and output filenames. Inferred from the path
@@ -257,7 +270,7 @@ class RadiologyImage:
 
         Clipping discards contrast the tissue of interest does not occupy, so
         the remaining range is spent where it matters. It also caps the effect
-        of metal artefacts and out-of-field air.
+        of metal artifacts and out-of-field air.
         """
         if min_value is None and max_value is None:
             raise ValueError("clip() needs min_value and/or max_value")
@@ -269,17 +282,17 @@ class RadiologyImage:
 
     def resample(
         self,
-        spacing: Sequence[Optional[Number]] = (0.8, 0.8, 3.0),
-        interpolator: str = "linear",
+        spacing: Spacing = (0.8, 0.8, 3.0),
+        interpolator: Interpolator = "linear",
     ) -> "RadiologyImage":
         """Resample onto a fixed voxel size in mm; ``None`` keeps an axis as is.
 
         CT series vary widely in slice thickness and in-plane resolution. Until
-        they share a voxel grid, a millimetre of anatomy means a different
+        they share a voxel grid, a millimeter of anatomy means a different
         number of voxels in each scan, and size or texture features are not
         comparable across a cohort.
 
-        The mask, when present, is resampled with nearest-neighbour so its
+        The mask, when present, is resampled with nearest-neighbor so its
         labels stay integral.
         """
         import SimpleITK as sitk
@@ -301,10 +314,6 @@ class RadiologyImage:
             "nearest": sitk.sitkNearestNeighbor,
             "bspline": sitk.sitkBSpline,
         }
-        if interpolator not in interpolators:
-            raise ValueError(
-                f"interpolator must be one of {sorted(interpolators)}, got {interpolator!r}"
-            )
 
         self._image = _resample_nifti(self.image, target, interpolators[interpolator])
         if self._mask is not None:
@@ -324,17 +333,19 @@ class RadiologyImage:
         fill_holes: bool = True,
         morphological_closing: bool = True,
         device: Optional[str] = None,
+        output_dir: Optional[PathArg] = None,
         replace: bool = False,
     ) -> "RadiologyImage":
         """Segment organs with TotalSegmentator and set :attr:`mask`.
 
-        Organs are labelled 1 and tumor 2. An existing mask (or `tumor_mask`)
+        Organs are labeled 1 and tumor 2. An existing mask (or `tumor_mask`)
         is treated as the tumor and merged in; with `restrict_organs_to_tumor`,
         only structures containing tumor are kept, so the healthy contralateral
         organ does not enter the ROI.
 
         Requires the ``TotalSegmentator`` package. Its files are written to a
-        temporary directory and removed once the masks are in memory.
+        temporary directory and removed once the masks are in memory; pass
+        `output_dir` to write them somewhere that is kept instead.
         """
         if organs is None:
             organs = _organs_from_metadata(self.metadata)
@@ -362,6 +373,7 @@ class RadiologyImage:
             morphological_closing=morphological_closing,
             device=device,
             modality=str(self.metadata.get("Modality", self.metadata.get("modality", "CT"))),
+            output_dir=output_dir,
         )
         organ_mask = seg.combine_organ_masks(list(components.values()))
 
@@ -379,66 +391,133 @@ class RadiologyImage:
             "segment", organs=list(components), task=task, has_tumor=existing_tumor is not None
         )
 
-    def select_best_slice(
+    def select_slice(
         self,
-        label: Union[int, Sequence[int]] = 2,
+        mode: SliceMode = "mask",
+        index: Optional[Integer] = None,
+        label: Optional[Labels] = None,
         keepdims: bool = False,
     ) -> "RadiologyImage":
-        """Reduce to the single axial slice containing the most of `label`.
+        """Reduce a volume to one axial slice — how a 3D series becomes a 2D example.
 
-        This is how a 3D series becomes a 2D training example. It requires a
-        mask; if the requested label is absent the first slice is returned and
-        the slice statistics record zero, rather than failing.
+        Two ways to choose it:
+
+        ``mode="mask"`` (the default)
+            The slice holding the most mask. Needs a mask. `label` says which
+            mask value counts; leave it out and the mask's only non-zero value
+            is used, which covers a binary mask. A mask with several labels is
+            ambiguous, so there `label` has to be given — ``2`` for the tumor
+            in this package's organ=1 / tumor=2 convention, ``[1, 2]`` for
+            both. If the requested label is absent, slice 0 is kept and the
+            recorded count is zero, rather than failing.
+
+        ``mode="index"``
+            The slice you name in `index`. Negative indices count from the end.
+            No mask needed.
+
+        `keepdims` keeps the third axis with length 1 instead of dropping it.
         """
-        if self.mask is None:
-            raise ValueError(
-                "select_best_slice() needs a mask to measure. Call .segment() first "
-                "or pass mask= when constructing the image."
-            )
         if self.ndim < 3:
-            return self._record("select_best_slice", label=label, changed=False)
+            return self._record("select_slice", mode=mode, changed=False)
 
-        mask_data = self.mask_array
-        wanted = (
-            np.isin(mask_data, list(label))
-            if isinstance(label, (list, tuple, set))
-            else (mask_data == label)
-        )
-        label_text = (
-            ",".join(str(value) for value in label)
-            if isinstance(label, (list, tuple, set)) else str(label)
-        )
+        n_slices = self.shape[2]
+        count: Optional[int] = None
 
-        area_per_slice = wanted.sum(axis=(0, 1))
-        best = int(np.argmax(area_per_slice))
-        count = int(area_per_slice[best])
-        if count == 0:
-            logger.warning(
-                "%s: label %s is absent from the mask; keeping slice 0.",
-                self.series_id or "image", label_text,
-            )
-            best = 0
+        if mode == "index":
+            if index is None:
+                raise ValueError(
+                    "select_slice(mode='index') needs index=<slice number>. Use "
+                    "mode='mask' to pick the slice with the most mask instead."
+                )
+            chosen = int(index)
+            if chosen < 0:
+                chosen += n_slices
+            if not 0 <= chosen < n_slices:
+                raise IndexError(
+                    f"{self.series_id or 'image'}: slice index {index} is out of range "
+                    f"for a volume with {n_slices} slices."
+                )
+        else:
+            if self.mask is None:
+                raise ValueError(
+                    "select_slice(mode='mask') needs a mask to measure. Call "
+                    ".segment() first, pass mask= when constructing the image, or "
+                    "use mode='index' to pick a slice number directly."
+                )
+            mask_data = self.mask_array
+            label = self._resolve_mask_label(label)
+            if label is None:  # an empty mask: nothing to measure
+                chosen, count = 0, 0
+            else:
+                wanted = (
+                    np.isin(mask_data, list(label))
+                    if isinstance(label, (list, tuple, set, np.ndarray))
+                    else (mask_data == label)
+                )
+                area_per_slice = wanted.sum(axis=(0, 1))
+                chosen = int(np.argmax(area_per_slice))
+                count = int(area_per_slice[chosen])
+                if count == 0:
+                    logger.warning(
+                        "%s: label %s is absent from the mask; keeping slice 0.",
+                        self.series_id or "image", _label_text(label),
+                    )
+                    chosen = 0
 
-        self.metadata[f"slice_with_most_label_{label_text}"] = best
-        self.metadata[f"n_label_{label_text}_voxels_in_slice"] = count
+        self.metadata["selected_slice"] = chosen
+        if mode == "mask":
+            self.metadata["selected_slice_label"] = label
+            self.metadata["selected_slice_mask_voxels"] = count
 
-        selector = (slice(None), slice(None), slice(best, best + 1))
+        selector = (slice(None), slice(None), slice(chosen, chosen + 1))
         image_slice = self.array[selector]
-        mask_slice = mask_data[selector]
         if not keepdims:
             image_slice = image_slice[:, :, 0]
-            mask_slice = mask_slice[:, :, 0]
 
-        affine = _shift_affine(self.affine, (0, 0, best))
+        affine = _shift_affine(self.affine, (0, 0, chosen))
         self._image = nib.Nifti1Image(image_slice, affine, self.image.header)
-        self._mask = nib.Nifti1Image(mask_slice, affine, self.mask.header)
-        return self._record("select_best_slice", label=label, index=best, n_voxels=count)
+        if self._mask is not None:
+            mask_slice = self.mask_array[selector]
+            if not keepdims:
+                mask_slice = mask_slice[:, :, 0]
+            self._mask = nib.Nifti1Image(mask_slice, affine, self.mask.header)
+
+        return self._record(
+            "select_slice", mode=mode, index=chosen, label=label, n_voxels=count
+        )
+
+    def _resolve_mask_label(
+        self, label: Optional[Union[int, Sequence[int]]]
+    ) -> Optional[Union[int, Sequence[int]]]:
+        """Default to the mask's only non-zero value; refuse to guess past that.
+
+        Returns ``None`` when the mask is empty, so there is nothing to measure.
+        """
+        if label is not None:
+            return label
+
+        present = self.labels
+        if len(present) == 1:
+            return present[0]
+        if not present:
+            logger.warning(
+                "%s: the mask is empty, so there is no label to select a slice by; "
+                "keeping slice 0.",
+                self.series_id or "image",
+            )
+            return None
+        raise ValueError(
+            f"{self.series_id or 'image'}: the mask holds several labels "
+            f"({', '.join(str(value) for value in present)}), so which one to "
+            "measure is ambiguous. Pass label= (in this package's convention 1 is "
+            "organ and 2 is tumor; a list measures several together)."
+        )
 
     def apply_mask(
         self,
-        labels: Optional[Union[int, Sequence[int]]] = None,
+        labels: Optional[Labels] = None,
         crop: bool = True,
-        padding: int = 5,
+        padding: Integer = 5,
         fill_value: Optional[Number] = None,
     ) -> "RadiologyImage":
         """Blank everything outside the mask, then crop to what is left.
@@ -499,7 +578,7 @@ class RadiologyImage:
         return self._record("apply_mask", labels=labels, crop=crop, padding=padding)
 
     def crop_to_content(
-        self, threshold: Optional[Number] = None, padding: int = 5
+        self, threshold: Optional[Number] = None, padding: Integer = 5
     ) -> "RadiologyImage":
         """Crop to the bounding box of voxels above `threshold` (default: the minimum)."""
         data = self.array
@@ -514,16 +593,16 @@ class RadiologyImage:
 
     def standardize_size(
         self,
-        x: Optional[int] = None,
-        y: Optional[int] = None,
-        z: Optional[int] = None,
+        x: Optional[Integer] = None,
+        y: Optional[Integer] = None,
+        z: Optional[Integer] = None,
         fill_value: Optional[Number] = None,
         mask_fill_value: Number = 0,
     ) -> "RadiologyImage":
-        """Centre-crop or centre-pad to a fixed array shape.
+        """Center-crop or center-pad to a fixed array shape.
 
         Models that take fixed-size tensors need every case to have the same
-        shape. Cropping and padding about the centre preserves voxel size (so
+        shape. Cropping and padding about the center preserves voxel size (so
         the anatomy stays the same physical scale), unlike rescaling.
         ``None`` leaves an axis untouched.
         """
@@ -541,9 +620,9 @@ class RadiologyImage:
 
     def normalize(
         self,
-        method: str = "volume",
-        mean: Optional[float] = None,
-        std: Optional[float] = None,
+        method: NormalizationMethod = "volume",
+        mean: Optional[Number] = None,
+        std: Optional[Number] = None,
         within_mask: bool = False,
     ) -> "RadiologyImage":
         """Z-score the intensities.
@@ -553,9 +632,6 @@ class RadiologyImage:
         cohort — use :meth:`Dataset.intensity_statistics`, which keeps every
         scan on one intensity scale so a model cannot key on per-scan offsets.
         """
-        if method not in ("volume", "dataset"):
-            raise ValueError(f"method must be 'volume' or 'dataset', got {method!r}")
-
         data = self.array.astype(np.float32, copy=True)
 
         if method == "dataset":
@@ -585,24 +661,31 @@ class RadiologyImage:
     # ------------------------------------------------------------------
     def process(
         self,
-        config: Optional[ProcessingConfig] = None,
+        config: Optional[Any] = None,
         **overrides: Any,
     ) -> "RadiologyImage":
         """Run the full protocol described by `config`, in order.
 
-        Steps whose inputs are missing are skipped with a warning rather than
-        raising, so one odd series does not stop a cohort. Pass keyword
-        arguments to override individual config fields.
+        `config` is a :class:`ProcessingConfig`, the name of a collection whose
+        curated protocol to use (``image.process("tcga-kirc")``), or a path to
+        a saved YAML protocol. Steps whose inputs are missing are skipped with
+        a warning rather than raising, so one odd series does not stop a
+        cohort. Pass keyword arguments to override individual config fields.
         """
-        config = config or ProcessingConfig()
-        if overrides:
-            config = config.replace(**overrides)
+        config = ProcessingConfig.resolve(config, **overrides)
         config.validate()
 
         if config.orient:
             self.orient(config.target_orientation)
 
         if config.segment:
+            # One subdirectory per series, so that a cohort sharing a config
+            # does not have every image overwrite the same filenames.
+            segmentation_dir = (
+                None
+                if config.segmentation_dir is None
+                else os.path.join(config.segmentation_dir, self.series_id or "image")
+            )
             self.segment(
                 organs=config.organs,
                 task=config.totalsegmentator_task,
@@ -612,6 +695,7 @@ class RadiologyImage:
                 fill_holes=config.fill_holes,
                 morphological_closing=config.morphological_closing,
                 device=config.device,
+                output_dir=segmentation_dir,
             )
 
         if config.clip:
@@ -621,12 +705,18 @@ class RadiologyImage:
             self.resample(config.target_spacing)
 
         if config.dimensionality == "2D":
-            if self.mask is None:
+            if config.slice_selection_mode == "mask" and self.mask is None:
                 raise ValueError(
-                    f"{self.series_id or 'image'}: 2D output requires a mask to pick "
-                    "the slice from. Enable segmentation or supply a mask."
+                    f"{self.series_id or 'image'}: 2D output with "
+                    "slice_selection_mode='mask' requires a mask to pick the slice "
+                    "from. Enable segmentation, supply a mask, or set "
+                    "slice_selection_mode='index' with slice_index=<number>."
                 )
-            self.select_best_slice(config.slice_selection_label)
+            self.select_slice(
+                mode=config.slice_selection_mode,
+                index=config.slice_index,
+                label=config.slice_selection_label,
+            )
 
         if config.mask:
             if self.mask is None:
@@ -668,13 +758,41 @@ class RadiologyImage:
     # ------------------------------------------------------------------
     # analysis
     # ------------------------------------------------------------------
-    def check(self, criteria: Optional[qc_module.QCCriteria] = None) -> qc_module.QCResult:
-        """Run quality control on this image. See :mod:`.qc`."""
-        return qc_module.check_volume(self.image, criteria, series_id=self.series_id)
+    def check(
+        self,
+        criteria: Union[qc_module.QCCriteria, QCPreset, None] = None,
+        level: QCLevel = "all",
+        **thresholds: Any,
+    ) -> qc_module.QCResult:
+        """Run quality control on this image. See :mod:`.qc`.
+
+        `criteria` is a :class:`QCCriteria` or the name of a preset; single
+        thresholds can be given as keywords, as in ``check(min_slices=25)``.
+
+        `level` selects which checks run: ``"metadata"`` uses only the headers
+        and :attr:`metadata`, so no pixel data is read; ``"volume"`` uses only
+        the reconstructed volume; ``"all"`` (the default) runs both and merges
+        the results.
+        """
+        criteria = qc_module.resolve_criteria(criteria, **thresholds)
+
+        sources: list = []
+        if level != "volume":
+            if self.metadata:
+                sources.append(self.metadata)
+            if self.source is not None and os.path.isdir(str(self.source)):
+                sources.append(str(self.source))
+
+        return qc_module.check(
+            None if level == "metadata" else self.image,
+            criteria,
+            series_id=self.series_id,
+            metadata=sources or None,
+        )
 
     def radiomics(
         self,
-        labels: Sequence[int] = (1, 2),
+        labels: Labels = (1, 2),
         params: Optional[Union[str, dict]] = None,
         **kwargs: Any,
     ) -> dict:
@@ -707,9 +825,9 @@ class RadiologyImage:
     # ------------------------------------------------------------------
     def save(
         self,
-        path: str,
-        mask_path: Optional[str] = None,
-        output_format: str = "nifti",
+        path: PathArg,
+        mask_path: Optional[PathArg] = None,
+        output_format: OutputFormat = "nifti",
         compress: bool = True,
         save_mask: bool = True,
     ) -> str:
@@ -814,6 +932,17 @@ class RadiologyImage:
         """Names of the steps applied so far, in order."""
         return [entry["step"] for entry in self.history]
 
+    def filter(self, *args: Any, **kwargs: Any):
+        """Not an image operation — defined only to say so.
+
+        A method rather than ``__getattr__``, so that mypy and editors keep
+        flagging every *other* misspelled attribute.
+        """
+        raise AttributeError(
+            "filter() drops series from a cohort. For one image use check(), "
+            "which returns a QCResult, or build a Dataset to filter over."
+        )
+
     def __repr__(self) -> str:
         name = self.series_id or "unnamed"
         if not self._loaded:
@@ -833,6 +962,12 @@ class RadiologyImage:
 # ----------------------------------------------------------------------
 # array / geometry helpers
 # ----------------------------------------------------------------------
+def _label_text(label: Union[int, Sequence[int]]) -> str:
+    if isinstance(label, (list, tuple, set, np.ndarray)):
+        return ",".join(str(value) for value in label)
+    return str(label)
+
+
 def _working_dtype(dtype: np.dtype) -> np.dtype:
     """Keep floats as they are; promote integers to float32 for arithmetic."""
     return dtype if np.issubdtype(dtype, np.floating) else np.dtype(np.float32)
@@ -944,7 +1079,7 @@ def _shift_affine(affine: np.ndarray, offset: Sequence[int]) -> np.ndarray:
 def _crop_or_pad(
     image: nib.Nifti1Image, dims: Sequence[Optional[int]], fill_value: Number
 ) -> nib.Nifti1Image:
-    """Centre-crop and/or centre-pad each axis to `dims`."""
+    """Center-crop and/or center-pad each axis to `dims`."""
     data = np.asanyarray(image.dataobj)
     current = data.shape
     target = tuple(

@@ -260,6 +260,156 @@ class TestCLI:
         written = ProcessingConfig.from_yaml(os.path.join(out_dir, "processing_config.yaml"))
         assert written.steps == ["orient"]
 
+    def test_segmentation_dir_reaches_the_config(self, tmp_path):
+        args = cli._build_parser().parse_args([
+            "process", "in", "--out", "out",
+            "--organs", "kidney_left",
+            "--segmentation-dir", str(tmp_path / "seg"),
+        ])
+        config = cli._config_from_args(args)
+        assert config.segmentation_dir == str(tmp_path / "seg")
+        assert config.segment  # asking to keep the masks enables the step
+
+    def test_segmentation_dir_does_not_re_enable_a_skipped_step(self, tmp_path):
+        args = cli._build_parser().parse_args([
+            "process", "in", "--out", "out",
+            "--no-segment", "--segmentation-dir", str(tmp_path / "seg"),
+        ])
+        assert cli._config_from_args(args).segment is False
+
     def test_errors_are_reported_without_a_traceback(self, capsys):
         assert cli.main(["process", "/nonexistent", "--out", "/tmp/x"]) == 1
         assert "error:" in capsys.readouterr().err
+
+
+@pytest.fixture
+def metadata_csv(tmp_path):
+    """A metadata table with one diagnostic series per unusable one."""
+    import pandas as pd
+
+    frame = pd.DataFrame([
+        {"series_id": "case_00", "Modality": "CT",
+         "SeriesDescription": "ARTERIAL PHASE 2.0", "SliceThickness": 2.0,
+         "ImageCount": 120},
+        {"series_id": "case_01", "Modality": "CT",
+         "SeriesDescription": "CT ABDOMEN B70f SHARP", "SliceThickness": 1.5,
+         "ImageCount": 90},
+        {"series_id": "case_02", "Modality": "CT",
+         "SeriesDescription": "SCOUT", "SliceThickness": 1.0, "ImageCount": 2},
+        {"series_id": "case_03", "Modality": "MR",
+         "SeriesDescription": "T2 AXIAL", "SliceThickness": 3.0, "ImageCount": 40},
+        {"series_id": "case_bad", "Modality": "CT",
+         "SeriesDescription": "CT ABDOMEN", "SliceThickness": 12.0,
+         "ImageCount": 60},
+    ])
+    path = tmp_path / "metadata.csv"
+    frame.to_csv(path, index=False)
+    return path
+
+
+class TestFilterCommand:
+    """The filter command, at both levels the protocol filters at."""
+
+    def _read(self, path):
+        import pandas as pd
+
+        return pd.read_csv(path)
+
+    def test_directory_reports_and_excludes(self, cohort_dir, tmp_path, capsys):
+        report = str(tmp_path / "qc.csv")
+        assert cli.main([
+            "filter", str(cohort_dir), "--report", report, "--min-slices", "10"
+        ]) == 0
+        assert "case_bad" in capsys.readouterr().out
+        frame = self._read(report)
+        assert not frame.set_index("series_id").loc["case_bad", "passed"]
+
+    def test_metadata_csv_needs_no_pixels(self, metadata_csv, tmp_path, capsys):
+        out = str(tmp_path / "kept.csv")
+        assert cli.main([
+            "filter", str(metadata_csv), "--metadata-out", out
+        ]) == 0
+
+        kept = self._read(out)
+        assert list(kept["series_id"]) == ["case_00", "case_01"]  # scout, MR, thick gone
+        assert kept["qc_passed"].all()
+        assert "3 of 5 series passed" not in capsys.readouterr().out  # 2 of 5
+
+    def test_metadata_csv_keeps_rejected_rows_when_asked(self, metadata_csv, tmp_path):
+        out = str(tmp_path / "annotated.csv")
+        cli.main([
+            "filter", str(metadata_csv), "--metadata-out", out, "--keep-rejected-rows"
+        ])
+        frame = self._read(out).set_index("series_id")
+        assert len(frame) == 5
+        assert "scout" in frame.loc["case_02", "qc_reason"].lower()
+
+    def test_radiomics_preset_drops_sharp_kernels(self, metadata_csv, tmp_path):
+        out = str(tmp_path / "kept.csv")
+        cli.main([
+            "filter", str(metadata_csv), "--preset", "radiomics", "--metadata-out", out
+        ])
+        assert list(self._read(out)["series_id"]) == ["case_00"]
+
+    def test_criteria_flags_override_the_preset(self, metadata_csv, tmp_path):
+        out = str(tmp_path / "kept.csv")
+        cli.main([
+            "filter", str(metadata_csv), "--modality", "any",
+            "--max-slice-thickness", "20", "--metadata-out", out,
+        ])
+        kept = list(self._read(out)["series_id"])
+        assert "case_03" in kept and "case_bad" in kept  # MR and thick slices allowed
+        assert "case_02" not in kept                      # the scout still goes
+
+    def test_metadata_level_skips_the_volume_checks(self, cohort_dir, tmp_path):
+        report = str(tmp_path / "qc.csv")
+        assert cli.main([
+            "filter", str(cohort_dir), "--level", "metadata", "--report", report
+        ]) == 0
+        frame = self._read(report)
+        assert frame["passed"].all()  # nothing in the headers disqualifies these
+
+    def test_annotates_an_existing_metadata_table(
+        self, cohort_dir, metadata_csv, tmp_path
+    ):
+        table = self._read(metadata_csv)
+        table.loc[len(table)] = {**table.iloc[0].to_dict(), "series_id": "case_elsewhere"}
+        table.to_csv(metadata_csv, index=False)
+
+        out = str(tmp_path / "metadata_filtered.csv")
+        assert cli.main([
+            "filter", str(cohort_dir), "--min-slices", "10",
+            "--metadata", str(metadata_csv), "--metadata-out", out,
+        ]) == 0
+        frame = self._read(out)
+        assert "case_bad" not in list(frame["series_id"])        # 3 slices: dropped
+        assert "case_elsewhere" in list(frame["series_id"])      # not measured: kept
+        assert frame.set_index("series_id").loc["case_00", "qc_passed"]
+
+    def test_moves_rejected_series_aside(self, cohort_dir, tmp_path, capsys):
+        excluded = str(tmp_path / "excluded")
+        assert cli.main([
+            "filter", str(cohort_dir), "--min-slices", "10", "--rejected-out", excluded
+        ]) == 0
+        assert os.path.exists(os.path.join(excluded, "case_bad", "imaging.nii.gz"))
+        assert not os.path.exists(os.path.join(str(cohort_dir), "case_bad"))
+        assert os.path.exists(os.path.join(str(cohort_dir), "case_00"))
+
+    def test_deleting_asks_first(self, cohort_dir, capsys):
+        assert cli.main([
+            "filter", str(cohort_dir), "--min-slices", "10", "--delete-rejected"
+        ]) == 0
+        assert os.path.exists(os.path.join(str(cohort_dir), "case_bad"))
+        assert "--yes" in capsys.readouterr().err
+
+    def test_deleting_with_yes(self, cohort_dir):
+        assert cli.main([
+            "filter", str(cohort_dir), "--min-slices", "10",
+            "--delete-rejected", "--yes",
+        ]) == 0
+        assert not os.path.exists(os.path.join(str(cohort_dir), "case_bad"))
+        assert os.path.exists(os.path.join(str(cohort_dir), "case_00"))
+
+    def test_volume_level_needs_images(self, metadata_csv, capsys):
+        assert cli.main(["filter", str(metadata_csv), "--level", "volume"]) == 1
+        assert "needs images" in capsys.readouterr().err

@@ -109,6 +109,70 @@ class TestFilter:
         dataset = Dataset.from_directory(str(cohort_dir))
         assert len(dataset.filter(QCCriteria.permissive(), progress=False)) == 6
 
+    def test_rejected_images_are_kept_for_disposal(self, cohort_dir):
+        dataset = Dataset.from_directory(str(cohort_dir))
+        kept = dataset.filter(LENIENT, progress=False)
+        assert [image.series_id for image in kept.rejected] == ["case_bad"]
+
+    def test_metadata_level_reads_no_volumes(self, cohort_dir):
+        dataset = Dataset.from_directory(str(cohort_dir))
+        kept = dataset.filter(LENIENT, level="metadata", progress=False)
+        assert len(kept) == 6  # nothing in the headers disqualifies these
+        assert "n_slices" not in kept.qc_report.columns
+
+    def test_metadata_level_uses_the_metadata_rows(self, cohort_dir):
+        import pandas as pd
+
+        from ctkit.dataset import Dataset as _Dataset
+
+        frame = pd.DataFrame([
+            {"series_id": "case_00", "Image": str(cohort_dir / "case_00" / "imaging.nii.gz"),
+             "Modality": "CT", "SeriesDescription": "ARTERIAL 2.0"},
+            {"series_id": "case_01", "Image": str(cohort_dir / "case_01" / "imaging.nii.gz"),
+             "Modality": "CT", "SeriesDescription": "SCOUT"},
+        ])
+        dataset = _Dataset.from_metadata(frame)
+        kept = dataset.filter(LENIENT, level="metadata", progress=False)
+        assert kept.series_ids == ["case_00"]
+
+    def test_rejects_an_unknown_level(self, cohort_dir):
+        dataset = Dataset.from_directory(str(cohort_dir))
+        with pytest.raises(ValueError, match="'metadata', 'volume' or 'all'"):
+            dataset.filter(LENIENT, level="headers", progress=False)
+
+
+class TestDiscard:
+    def test_moves_a_case_directory(self, cohort_dir, tmp_path):
+        from ctkit.dataset import discard
+
+        dataset = Dataset.from_directory(str(cohort_dir))
+        rejected = dataset.filter(LENIENT, progress=False).rejected
+        moved = discard(rejected, destination=str(tmp_path / "excluded"))
+
+        assert len(moved) == 1
+        assert (tmp_path / "excluded" / "case_bad" / "imaging.nii.gz").exists()
+        assert not (cohort_dir / "case_bad").exists()
+
+    def test_deletes_when_asked(self, cohort_dir):
+        from ctkit.dataset import discard
+
+        dataset = Dataset.from_directory(str(cohort_dir))
+        discard(dataset.filter(LENIENT, progress=False).rejected, delete=True)
+        assert not (cohort_dir / "case_bad").exists()
+        assert (cohort_dir / "case_00" / "imaging.nii.gz").exists()
+
+    def test_needs_a_destination_or_delete(self, cohort_dir):
+        from ctkit.dataset import discard
+
+        with pytest.raises(ValueError, match="either a destination or delete"):
+            discard(Dataset.from_directory(str(cohort_dir)).images)
+
+    def test_leaves_in_memory_images_alone(self, image):
+        from ctkit.dataset import discard, files_of
+
+        assert files_of(image) == []
+        assert discard([image], delete=True) == []
+
 
 class TestCohortStatistics:
     def test_shape_percentile(self, cohort_dir):
@@ -251,7 +315,7 @@ class TestProcess:
 
     def test_rejects_an_unknown_cache_mode(self, cohort_dir):
         dataset = Dataset.from_directory(str(cohort_dir))
-        with pytest.raises(ValueError, match="cache must be"):
+        with pytest.raises(ValueError, match="'auto', 'disk' or 'none'"):
             dataset.process(ProcessingConfig(segment=False), cache="maybe")
 
     def test_config_is_written_alongside_the_results(self, cohort_dir, tmp_path):
@@ -303,7 +367,10 @@ class TestProcess:
     def test_a_failing_case_does_not_stop_the_cohort(self, cohort_dir, tmp_path, caplog):
         dataset = Dataset.from_directory(str(cohort_dir))  # includes case_bad
         processed = dataset.process(
-            ProcessingConfig(segment=False, dimensionality="2D", standardize_size=False),
+            ProcessingConfig(
+                segment=False, dimensionality="2D", slice_selection_label=2,
+                standardize_size=False,
+            ),
             out_dir=str(tmp_path / "out"), progress=False, on_error="warn",
         )
         # case_bad has no mask, so 2D slice selection cannot run for it.
@@ -314,7 +381,10 @@ class TestProcess:
         dataset = Dataset.from_directory(str(cohort_dir))
         with pytest.raises(ValueError):
             dataset.process(
-                ProcessingConfig(segment=False, dimensionality="2D", standardize_size=False),
+                ProcessingConfig(
+                segment=False, dimensionality="2D", slice_selection_label=2,
+                standardize_size=False,
+            ),
                 out_dir=str(tmp_path / "out"), progress=False, on_error="raise",
             )
 

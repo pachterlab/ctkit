@@ -91,7 +91,7 @@ def _add_datasets_command(subparsers) -> None:
 
 def _add_download_command(subparsers) -> None:
     parser = subparsers.add_parser("download", help="download a collection from TCIA")
-    parser.add_argument("dataset", help="catalogue name or TCIA collection name")
+    parser.add_argument("dataset", help="catalog name or TCIA collection name")
     parser.add_argument("--out", required=True, help="destination directory")
     parser.add_argument("--modality", default="CT", help="modality filter (default: CT)")
     parser.add_argument("--limit", type=int, help="stop after this many series")
@@ -166,20 +166,124 @@ def _add_process_command(subparsers) -> None:
         help="target array shape (default: the 95th percentile of the cohort)",
     )
     steps.add_argument("--organs", nargs="+", help="TotalSegmentator structures to segment")
+    steps.add_argument(
+        "--segmentation-dir", metavar="DIR",
+        help="keep the TotalSegmentator files here, one subdirectory per series "
+             "(default: a temporary directory, deleted once the masks are read)",
+    )
+    steps.add_argument(
+        "--slice-mode", choices=["mask", "index"],
+        help="how 2D mode picks its slice: the one with the most mask (default) "
+             "or the one named by --slice-index",
+    )
+    steps.add_argument(
+        "--slice-index", type=int, help="which slice to keep, with --slice-mode index"
+    )
+    steps.add_argument(
+        "--slice-label", nargs="+", type=int, metavar="LABEL",
+        help="mask values to measure when picking the slice (default: the mask's "
+             "only non-zero value)",
+    )
     parser.set_defaults(handler=_run_process)
 
 
 def _add_filter_command(subparsers) -> None:
     parser = subparsers.add_parser(
-        "filter", help="run quality control and report which series are usable"
+        "filter",
+        help="run quality control and report which series are usable",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        description=(
+            "Decide which series are worth processing, at two levels.\n\n"
+            "Metadata checks read headers only — modality, localizer/scout/MIP "
+            "keywords, slice thickness, slice count — so they run before any "
+            "pixels are read, and on a metadata CSV before anything is even "
+            "downloaded. Volume checks read the reconstructed image: 4D series, "
+            "too few slices, extreme voxel spacing, in-plane anisotropy that "
+            "marks a reformat rather than an axial acquisition.\n\n"
+            "INPUT is a directory of images or DICOM series, or a metadata CSV "
+            "(in which case only the metadata checks apply)."
+        ),
+        epilog=(
+            "examples:\n"
+            "  ctkit filter data/raw --report qc.csv\n"
+            "  ctkit filter metadata.csv --metadata-out metadata_filtered.csv\n"
+            "  ctkit filter data/raw --level metadata --preset radiomics\n"
+            "  ctkit filter data/raw --metadata metadata.csv --rejected-out data/excluded\n"
+        ),
     )
-    parser.add_argument("input", help="directory of images")
-    parser.add_argument("--report", help="write the full pass/fail table to this CSV")
-    parser.add_argument("--out", help="copy the series that pass into this directory")
-    parser.add_argument("--min-slices", type=int, default=25)
-    parser.add_argument("--max-spacing", type=float, default=20.0)
-    parser.add_argument("--max-anisotropy", type=float, default=4.0)
-    parser.add_argument("--allow-4d", action="store_true")
+    parser.add_argument(
+        "input", help="directory of images or DICOM series, or a metadata CSV"
+    )
+    parser.add_argument(
+        "--level", choices=["metadata", "volume", "all"], default="all",
+        help="which checks to run (default: all)",
+    )
+    parser.add_argument(
+        "--preset", choices=["default", "radiomics", "permissive"], default="default",
+        help="starting thresholds: radiomics also drops sharp kernels, permissive "
+             "drops only what cannot be processed at all",
+    )
+
+    outputs = parser.add_argument_group("outputs")
+    outputs.add_argument("--report", help="write the full pass/fail table to this CSV")
+    outputs.add_argument("--out", help="write the series that pass into this directory")
+    outputs.add_argument(
+        "--metadata", help="a metadata CSV to annotate with the outcome (directory input)"
+    )
+    outputs.add_argument(
+        "--metadata-out",
+        help="where the annotated metadata goes (default: <input>_filtered.csv)",
+    )
+    outputs.add_argument(
+        "--metadata-key", default="series_id",
+        help="metadata column holding the series id (default: series_id)",
+    )
+    outputs.add_argument(
+        "--keep-rejected-rows", action="store_true",
+        help="annotate the metadata but keep the rows that failed",
+    )
+    outputs.add_argument(
+        "--rejected-out", metavar="DIR",
+        help="move the files of the series that fail here",
+    )
+    outputs.add_argument(
+        "--delete-rejected", action="store_true",
+        help="delete the files of the series that fail (asks for confirmation)",
+    )
+    outputs.add_argument(
+        "--yes", action="store_true", help="skip the confirmation prompt"
+    )
+
+    checks = parser.add_argument_group("criteria (override the preset)")
+    checks.add_argument("--modality", help="required modality, or 'any' (default: CT)")
+    checks.add_argument("--min-slices", type=int, help="fewest usable slices (default: 25)")
+    checks.add_argument(
+        "--max-slice-thickness", type=float, metavar="MM",
+        help="thickest acceptable slice from the headers (default: 10)",
+    )
+    checks.add_argument(
+        "--max-spacing", type=float, metavar="MM",
+        help="largest acceptable voxel dimension (default: 20)",
+    )
+    checks.add_argument(
+        "--max-anisotropy", type=float,
+        help="largest acceptable in-plane spacing ratio (default: 4)",
+    )
+    checks.add_argument("--allow-4d", action="store_true", help="keep 4D series")
+    checks.add_argument(
+        "--exclude-keywords", nargs="+", metavar="WORD",
+        help="series description keywords that disqualify a series "
+             "(default: localizer, scout, topogram, MIP, ...)",
+    )
+    checks.add_argument(
+        "--exclude-sharp-kernels", action="store_true",
+        help="also drop B50-B80 and bone kernels, whose noise dominates texture features",
+    )
+    checks.add_argument(
+        "--require-si-axis", action="store_true",
+        help="drop series whose thickest axis is not superior-inferior "
+             "(coronal/sagittal reformats)",
+    )
     parser.set_defaults(handler=_run_filter)
 
 
@@ -300,34 +404,200 @@ def _run_process(args) -> int:
 
 
 def _run_filter(args) -> int:
-    from .dataset import Dataset
-    from .qc import QCCriteria
+    criteria = _criteria_from_args(args)
+    if args.input.lower().endswith((".csv", ".tsv")):
+        return _filter_metadata_table(args, criteria)
+    return _filter_directory(args, criteria)
 
-    criteria = QCCriteria(
-        min_slices=args.min_slices,
-        max_spacing=args.max_spacing,
-        max_in_plane_anisotropy=args.max_anisotropy,
-        reject_4d=not args.allow_4d,
-    )
+
+def _filter_directory(args, criteria) -> int:
+    from .dataset import Dataset, discard
+
     dataset = Dataset.from_directory(args.input)
-    kept = dataset.filter(criteria)
-
+    kept = dataset.filter(criteria, level=args.level)
     report = kept.qc_report
-    if args.report:
-        report.to_csv(args.report, index=False)
-        print(f"Wrote the quality control report to {args.report}")
 
-    failed = report[~report["passed"]]
-    print(f"{len(kept)} of {len(dataset)} series passed quality control.")
-    if len(failed):
-        print("\nExcluded:")
-        with _wide_output():
-            print(failed[["series_id", "reason"]].to_string(index=False))
+    _report_outcome(report, len(kept), len(dataset))
+    if args.report:
+        _write_csv(report, args.report)
+        print(f"\nWrote the quality control report to {args.report}")
+
+    if args.metadata:
+        destination = args.metadata_out or _suffixed(args.metadata, "_filtered")
+        rows = _annotate_metadata(
+            args.metadata, report, destination,
+            key=args.metadata_key, drop_rejected=not args.keep_rejected_rows,
+        )
+        print(f"Wrote {rows} metadata rows to {destination}")
 
     if args.out:
         kept.save(args.out)
-        print(f"\nCopied the series that passed to {args.out}")
+        print(f"\nWrote the series that passed to {args.out}")
+
+    rejected = dataset.rejected
+    if rejected and (args.rejected_out or args.delete_rejected):
+        if args.delete_rejected and not _confirm(
+            f"Delete the files of {len(rejected)} rejected series under {args.input}?",
+            args.yes,
+        ):
+            print("Left them in place.")
+            return 0
+        paths = discard(
+            rejected,
+            destination=None if args.delete_rejected else args.rejected_out,
+            delete=args.delete_rejected,
+        )
+        verb = "Deleted" if args.delete_rejected else f"Moved to {args.rejected_out}:"
+        print(f"\n{verb} {len(paths)} paths.")
     return 0
+
+
+def _filter_metadata_table(args, criteria) -> int:
+    """Filter a metadata CSV — the pass that runs before anything is downloaded."""
+    import pandas as pd
+
+    from .qc import check_series_metadata
+
+    if args.level == "volume":
+        raise ValueError(
+            "--level volume needs images to read; give a directory instead of a "
+            "metadata CSV, or use --level metadata."
+        )
+
+    frame = pd.read_csv(args.input)
+    key = args.metadata_key if args.metadata_key in frame.columns else None
+    results = [
+        check_series_metadata(
+            row, criteria, series_id=None if key is None else str(row[key])
+        )
+        for _, row in frame.iterrows()
+    ]
+    report = pd.DataFrame([result.to_dict() for result in results])
+    if key is not None:
+        report["series_id"] = frame[key].astype(str).values
+
+    passed = report["passed"].to_numpy()
+    _report_outcome(report, int(passed.sum()), len(frame))
+    if args.report:
+        _write_csv(report, args.report)
+        print(f"\nWrote the quality control report to {args.report}")
+
+    destination = args.metadata_out or _suffixed(args.input, "_filtered")
+    annotated = frame.drop(columns=["qc_passed", "qc_reason"], errors="ignore").copy()
+    annotated["qc_passed"] = passed
+    annotated["qc_reason"] = [result.reason for result in results]
+    if not args.keep_rejected_rows:
+        annotated = annotated[annotated["qc_passed"]]
+    _write_csv(annotated, destination)
+    print(f"Wrote {len(annotated)} metadata rows to {destination}")
+    return 0
+
+
+def _report_outcome(report, n_kept: int, n_total: int) -> None:
+    print(f"{n_kept} of {n_total} series passed quality control.")
+    failed = report[~report["passed"].astype(bool)]
+    if len(failed):
+        columns = [
+            column for column in ("series_id", "reason") if column in failed.columns
+        ]
+        print("\nExcluded:")
+        with _wide_output():
+            print(failed[columns].to_string(index=False))
+
+
+def _annotate_metadata(
+    path: str, report, destination: str, key: str = "series_id",
+    drop_rejected: bool = True,
+) -> int:
+    """Merge the pass/fail outcome into a metadata table, keyed by series id.
+
+    Rows with no matching series in the input are left alone: they were never
+    measured, which is not the same as having failed.
+    """
+    import pandas as pd
+
+    frame = pd.read_csv(path)
+    if key not in frame.columns:
+        raise ValueError(
+            f"{path} has no {key!r} column to match series on "
+            f"(columns: {', '.join(map(str, frame.columns))}). Use --metadata-key."
+        )
+
+    outcome = report[["series_id", "passed", "reason"]].rename(
+        columns={"series_id": key, "passed": "qc_passed", "reason": "qc_reason"}
+    )
+    outcome[key] = outcome[key].astype(str)
+
+    merged = frame.drop(columns=["qc_passed", "qc_reason"], errors="ignore").copy()
+    merged[key] = merged[key].astype(str)
+    merged = merged.merge(outcome, on=key, how="left")
+
+    unmatched = int(merged["qc_passed"].isna().sum())
+    if unmatched:
+        print(
+            f"{unmatched} metadata rows had no matching series in the input; "
+            "they were not checked and are kept."
+        )
+    if drop_rejected:
+        merged = merged[merged["qc_passed"].ne(False)]  # unmeasured rows stay
+
+    _write_csv(merged, destination)
+    return len(merged)
+
+
+def _criteria_from_args(args):
+    from .qc import QCCriteria
+
+    if args.preset == "radiomics":
+        criteria = QCCriteria.for_radiomics()
+    elif args.preset == "permissive":
+        criteria = QCCriteria.permissive()
+    else:
+        criteria = QCCriteria()
+
+    if args.modality is not None:
+        criteria.modality = None if args.modality.lower() == "any" else args.modality
+    for name, value in (
+        ("min_slices", args.min_slices),
+        ("max_slice_thickness", args.max_slice_thickness),
+        ("max_spacing", args.max_spacing),
+        ("max_in_plane_anisotropy", args.max_anisotropy),
+    ):
+        if value is not None:
+            setattr(criteria, name, value)
+    if args.exclude_keywords:
+        criteria.exclude_keywords = tuple(args.exclude_keywords)
+    if args.exclude_sharp_kernels:
+        criteria.exclude_sharp_kernels = True
+    if args.allow_4d:
+        criteria.reject_4d = False
+    if args.require_si_axis:
+        criteria.require_thickest_axis_is_superior_inferior = True
+    return criteria
+
+
+def _confirm(question: str, assume_yes: bool = False) -> bool:
+    if assume_yes:
+        return True
+    if not sys.stdin.isatty():
+        print(
+            f"{question} Refusing to delete without a terminal to ask in; "
+            "pass --yes to go ahead.",
+            file=sys.stderr,
+        )
+        return False
+    return input(f"{question} [y/N] ").strip().lower() in ("y", "yes")
+
+
+def _write_csv(frame, path: str) -> None:
+    directory = os.path.dirname(os.path.abspath(path))
+    os.makedirs(directory, exist_ok=True)
+    frame.to_csv(path, index=False)
+
+
+def _suffixed(path: str, suffix: str) -> str:
+    stem, extension = os.path.splitext(path)
+    return f"{stem}{suffix}{extension or '.csv'}"
 
 
 def _run_radiomics(args) -> int:
@@ -416,6 +686,15 @@ def _config_from_args(args):
         overrides["standardize_size"] = args.standardize_size
     if args.dimensionality:
         overrides["dimensionality"] = args.dimensionality
+    if args.slice_mode:
+        overrides["slice_selection_mode"] = args.slice_mode
+    if args.slice_index is not None:
+        overrides["slice_index"] = args.slice_index
+        overrides.setdefault("slice_selection_mode", "index")
+    if args.slice_label:
+        overrides["slice_selection_label"] = (
+            args.slice_label[0] if len(args.slice_label) == 1 else list(args.slice_label)
+        )
     if args.clip_min is not None:
         overrides["clip_min"] = args.clip_min
     if args.clip_max is not None:
@@ -426,6 +705,9 @@ def _config_from_args(args):
         overrides["target_shape"] = tuple(args.shape)
     if args.organs:
         overrides["organs"] = list(args.organs)
+        overrides.setdefault("segment", True)
+    if args.segmentation_dir:
+        overrides["segmentation_dir"] = args.segmentation_dir
         overrides.setdefault("segment", True)
     if args.output_format:
         overrides["output_format"] = args.output_format

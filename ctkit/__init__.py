@@ -4,30 +4,29 @@ The package exists so that "how was this image processed?" has an exact,
 runnable answer. A protocol is a :class:`ProcessingConfig`; applying it to one
 scan is :class:`RadiologyImage`, and to a cohort is :class:`Dataset`.
 
-Quick start::
+Quick start — construct a cohort or a scan, then call the steps on it::
 
-    from ctkit import RadiologyImage, ProcessingConfig
+    import ctkit
 
-    config = ProcessingConfig.for_dataset("tcga-kirc")
-    RadiologyImage("case/imaging.nii.gz", mask="case/segmentation.nii.gz") \\
-        .process(config) \\
-        .save("processed/case.nii.gz")
+    ctkit.download("tcga-kirc", "data/raw", limit=20)
 
-A whole collection, from download to processed volumes::
+    data = ctkit.Dataset("data/raw")
+    data.filter(min_slices=25).process("tcga-kirc", out_dir="data/processed")
 
-    from ctkit import download, Dataset, ProcessingConfig
+The same steps chain on one scan, modifying it in place::
 
-    download("tcga-kirc", "data/raw", limit=20)
-    Dataset.from_directory("data/raw").filter().process(
-        ProcessingConfig.for_dataset("tcga-kirc"), out_dir="data/processed"
-    )
+    scan = ctkit.RadiologyImage("case/imaging.nii.gz", mask="case/segmentation.nii.gz")
+    scan.orient().clip(-200, 300).resample((0.8, 0.8, 3.0)).save("processed/case.nii.gz")
 
-Individual steps are also available as methods, so a protocol can be built up
-one operation at a time::
+Each step is also a function taking whatever you have — a path, an array, a
+scan, or a cohort::
 
-    image.orient().clip(-200, 300).resample((0.8, 0.8, 3.0)).apply_mask()
+    ctkit.clip("case/imaging.nii.gz", -200, 300)
 
-Nothing is written to disk until ``.save()``; intermediate volumes only ever
+and a field of a :class:`ProcessingConfig`, which is what makes a protocol
+something you can print, save to YAML, and publish alongside a paper.
+
+Nothing is written to disk until ``save()``; intermediate volumes only ever
 exist in memory.
 """
 
@@ -38,6 +37,22 @@ from typing import TYPE_CHECKING
 
 __version__ = "0.1.0"
 
+from .api import (
+    apply_mask,
+    check,
+    clip,
+    crop_to_content,
+    filter,
+    normalize,
+    orient,
+    process,
+    radiomics,
+    resample,
+    save,
+    segment,
+    select_slice,
+    standardize_size,
+)
 from .config import ProcessingConfig
 from .constants import tcia_dataset_to_info
 from .dataset import Dataset
@@ -53,6 +68,21 @@ if TYPE_CHECKING:  # pragma: no cover
 
 __all__ = [
     "__version__",
+    # pipeline steps, in the order they run
+    "filter",
+    "orient",
+    "segment",
+    "clip",
+    "resample",
+    "select_slice",
+    "apply_mask",
+    "crop_to_content",
+    "standardize_size",
+    "normalize",
+    # whole protocols and output
+    "process",
+    "save",
+    "radiomics",
     # core
     "RadiologyImage",
     "Dataset",
@@ -60,6 +90,7 @@ __all__ = [
     # quality control
     "QCCriteria",
     "QCResult",
+    "check",
     "check_volume",
     "check_series_metadata",
     # data access

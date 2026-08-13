@@ -9,10 +9,18 @@ reproduce a dataset exactly.
 from __future__ import annotations
 
 import json
+import os
 from dataclasses import asdict, dataclass, fields
 from typing import Any, Optional, Sequence, Union
 
 from .constants import tcia_dataset_to_info
+from .validation import (
+    OUTPUT_FORMATS,
+    Dimensionality,
+    NormalizationMethod,
+    OutputFormat,
+    SliceMode,
+)
 
 Number = Union[int, float]
 
@@ -43,6 +51,10 @@ class ProcessingConfig:
     restrict_organs_to_tumor: bool = True
     fast_segmentation: bool = False
     device: Optional[str] = None
+    #: Where to keep the TotalSegmentator files. ``None`` writes them to a
+    #: temporary directory and deletes them once the masks are in memory; a
+    #: path keeps them, one subdirectory per series.
+    segmentation_dir: Optional[str] = None
 
     # ---- 3. intensity clipping ----------------------------------------
     clip: bool = True
@@ -54,8 +66,15 @@ class ProcessingConfig:
     target_spacing: Sequence[Optional[Number]] = (0.8, 0.8, 3.0)
 
     # ---- 5. slice selection (2D only) ----------------------------------
-    dimensionality: str = "3D"
-    slice_selection_label: Union[int, Sequence[int]] = 2
+    dimensionality: Dimensionality = "3D"
+    #: ``"mask"`` keeps the slice with the most mask, ``"index"`` the slice
+    #: named by ``slice_index``.
+    slice_selection_mode: SliceMode = "mask"
+    #: Which mask value to measure. ``None`` uses the mask's only non-zero
+    #: value, which is unambiguous for a binary mask; a multi-label mask needs
+    #: this set (1 is organ and 2 tumor by this package's convention).
+    slice_selection_label: Optional[Union[int, Sequence[int]]] = None
+    slice_index: Optional[int] = None
 
     # ---- 6. masking ----------------------------------------------------
     mask: bool = True
@@ -70,12 +89,12 @@ class ProcessingConfig:
 
     # ---- 8. intensity normalization -------------------------------------
     normalize: bool = False
-    normalization_method: str = "volume"
+    normalization_method: NormalizationMethod = "volume"
     dataset_mean: Optional[float] = None
     dataset_std: Optional[float] = None
 
     # ---- output --------------------------------------------------------
-    output_format: str = "nifti"
+    output_format: OutputFormat = "nifti"
     compress: bool = True
     save_mask: bool = True
     dtype: str = "float32"
@@ -113,14 +132,29 @@ class ProcessingConfig:
             raise ValueError(
                 f"dimensionality must be '2D' or '3D', got {self.dimensionality!r}"
             )
+        if self.slice_selection_mode not in ("mask", "index"):
+            raise ValueError(
+                "slice_selection_mode must be 'mask' (the slice with the most mask) "
+                f"or 'index' (a slice number), got {self.slice_selection_mode!r}"
+            )
+        if (self.dimensionality == "2D" and self.slice_selection_mode == "index"
+                and self.slice_index is None):
+            raise ValueError(
+                "slice_selection_mode='index' requires slice_index=<slice number>. "
+                "Use slice_selection_mode='mask' to pick the slice with the most "
+                "mask instead."
+            )
         if self.normalization_method not in ("volume", "dataset"):
             raise ValueError(
                 "normalization_method must be 'volume' or 'dataset', got "
                 f"{self.normalization_method!r}"
             )
-        if self.output_format not in ("nifti", "numpy", "npy"):
+        if self.output_format not in OUTPUT_FORMATS:
             raise ValueError(
-                f"output_format must be 'nifti' or 'numpy', got {self.output_format!r}"
+                f"output_format must be one of {', '.join(OUTPUT_FORMATS)}, "
+                f"got {self.output_format!r}. DICOM output is not supported: a "
+                "processed volume is no longer the acquisition its headers "
+                "describe."
             )
         if self.clip and self.clip_min is None and self.clip_max is None:
             raise ValueError(
@@ -146,6 +180,37 @@ class ProcessingConfig:
     # ------------------------------------------------------------------
     # constructors
     # ------------------------------------------------------------------
+    @classmethod
+    def resolve(cls, config: Any = None, **overrides: Any) -> "ProcessingConfig":
+        """A protocol from whatever names one.
+
+        ``None`` gives the defaults, a :class:`ProcessingConfig` is returned as
+        is, a mapping is expanded into one, and a string is either a path to a
+        saved protocol or the name of a collection whose curated protocol to
+        use::
+
+            ProcessingConfig.resolve("tcga-kirc")
+            ProcessingConfig.resolve("data/processed/processing_config.yaml")
+
+        This is what lets ``process()`` take any of them.
+        """
+        if config is None:
+            resolved = cls()
+        elif isinstance(config, ProcessingConfig):
+            resolved = config
+        elif isinstance(config, dict):
+            resolved = cls(**config)
+        elif isinstance(config, (str, os.PathLike)):
+            source = str(config)
+            resolved = cls.from_yaml(source) if os.path.exists(source) else cls.for_dataset(source)
+        else:
+            raise TypeError(
+                f"Cannot read a protocol from {type(config).__name__}. Expected a "
+                "ProcessingConfig, a collection name, a path to a saved protocol, "
+                "or None for the defaults."
+            )
+        return resolved.replace(**overrides) if overrides else resolved
+
     @classmethod
     def for_dataset(
         cls, dataset: str, masked: bool = True, **overrides: Any
@@ -320,8 +385,14 @@ class ProcessingConfig:
             "clip": f"clip intensities to [{self.clip_min}, {self.clip_max}] HU",
             "resample": f"resample to {tuple(self.target_spacing)} mm voxels",
             "select_slice": (
-                f"select the axial slice with the most label "
-                f"{self.slice_selection_label}"
+                f"keep axial slice {self.slice_index}"
+                if self.slice_selection_mode == "index"
+                else "keep the axial slice with the most mask"
+                + (
+                    ""
+                    if self.slice_selection_label is None
+                    else f" (label {self.slice_selection_label})"
+                )
             ),
             "apply_mask": (
                 "mask to "

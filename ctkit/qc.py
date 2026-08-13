@@ -10,14 +10,19 @@ cheaply throw data away:
   too-few slices, extreme voxel spacing and anisotropic in-plane sampling.
 
 Both return a :class:`QCResult`, which is falsy when the series should be
-dropped and carries the reasons why.
+dropped and carries the reasons why. :func:`check` runs whichever of the two
+applies to what you hand it and merges the outcomes;
+:meth:`~ctkit.Dataset.filter` is the same thing over a cohort.
 """
 
 from __future__ import annotations
 
 import logging
 import os
+import re
 from dataclasses import dataclass, field
+from dataclasses import fields as dataclass_fields
+from dataclasses import replace as dataclass_replace
 from typing import Any, Mapping, Optional, Sequence
 
 import nibabel as nib
@@ -118,6 +123,44 @@ class QCCriteria:
         )
         params.update(overrides)
         return cls(**params)
+
+
+#: The presets, by the name you can pass instead of a `QCCriteria`.
+PRESETS = {
+    "default": QCCriteria,
+    "radiomics": QCCriteria.for_radiomics,
+    "permissive": QCCriteria.permissive,
+}
+
+
+def resolve_criteria(
+    criteria: Optional[Any] = None, **thresholds: Any
+) -> QCCriteria:
+    """A :class:`QCCriteria` from an object, a preset name, or bare thresholds.
+
+    This is what lets ``filter(min_slices=25)`` and ``filter("radiomics")``
+    mean the same thing as building the object yourself.
+    """
+    if isinstance(criteria, str):
+        if criteria not in PRESETS:
+            raise ValueError(
+                f"Unknown quality control preset {criteria!r}; "
+                f"expected one of {', '.join(sorted(PRESETS))}."
+            )
+        base = PRESETS[criteria]()
+    else:
+        base = criteria or QCCriteria()
+
+    if not thresholds:
+        return base
+    known = {item.name for item in dataclass_fields(QCCriteria)}
+    unknown = sorted(set(thresholds) - known)
+    if unknown:
+        raise TypeError(
+            f"Unknown quality control threshold(s): {', '.join(unknown)}. "
+            f"Available: {', '.join(sorted(known))}."
+        )
+    return dataclass_replace(base, **thresholds)
 
 
 # ----------------------------------------------------------------------
@@ -235,8 +278,7 @@ def _apply_metadata_criteria(
             result.fail(f"modality is {fields['modality']}, not {criteria.modality}")
 
     for keyword in criteria.exclude_keywords or ():
-        keyword_lower = keyword.lower()
-        if any(keyword_lower in part for part in text):
+        if any(_mentions(part, keyword) for part in text):
             result.fail(f"excluded keyword {keyword!r} in series description/image type")
             break
 
@@ -346,28 +388,69 @@ def check_volume(
 
 
 def check(
-    image: Any,
+    image: Any = None,
     criteria: Optional[QCCriteria] = None,
     series_id: Optional[str] = None,
+    metadata: Any = None,
 ) -> QCResult:
-    """Run every applicable check on `image` (a volume, path, or DICOM dir)."""
+    """Run every applicable check and merge the outcomes into one result.
+
+    `image` is a volume, a path to one, or a DICOM directory; `metadata` is a
+    DICOM header, a metadata row, a path, or a list of those. A DICOM directory
+    passed as `image` is used as a metadata source as well, since its headers
+    and file count are the cheapest checks available.
+
+    Pass ``image=None`` to check metadata alone — no pixel data is read, which
+    is what makes it usable before a collection has been downloaded. With
+    nothing to check the result passes: quality control drops series that are
+    demonstrably unusable, not series nothing is known about.
+    """
     criteria = criteria or QCCriteria()
+
+    sources = list(metadata) if isinstance(metadata, (list, tuple)) else [metadata]
     if isinstance(image, (str, os.PathLike)) and os.path.isdir(str(image)):
-        metadata_result = check_series_metadata(image, criteria, series_id=series_id)
-        volume_result = check_volume(image, criteria, series_id=series_id)
-        merged = QCResult(
-            passed=metadata_result.passed and volume_result.passed,
-            reasons=metadata_result.reasons + volume_result.reasons,
-            stats={**metadata_result.stats, **volume_result.stats},
-            series_id=series_id,
-        )
-        return merged
-    return check_volume(image, criteria, series_id=series_id)
+        sources.append(str(image))
+
+    results = [
+        check_series_metadata(source, criteria, series_id=series_id)
+        for source in sources
+        if source is not None and not (isinstance(source, Mapping) and not source)
+    ]
+    if image is not None:
+        results.append(check_volume(image, criteria, series_id=series_id))
+
+    if not results:
+        logger.debug("%s: nothing to check.", series_id or "image")
+        return QCResult(series_id=series_id)
+    return merge(results, series_id=series_id)
+
+
+def merge(results: Sequence[QCResult], series_id: Optional[str] = None) -> QCResult:
+    """Combine several results: passes only if all of them pass."""
+    merged = QCResult(series_id=series_id)
+    for result in results:
+        merged.passed = merged.passed and result.passed
+        merged.reasons.extend(result.reasons)
+        merged.stats.update(result.stats)
+        if merged.series_id is None:
+            merged.series_id = result.series_id
+    return merged
 
 
 # ----------------------------------------------------------------------
 # helpers
 # ----------------------------------------------------------------------
+def _mentions(text: str, keyword: str) -> bool:
+    """Whole-word keyword match.
+
+    Series descriptions are terse and abbreviated, so several of the keywords
+    are short (``cal``, ``mip``, ``pjn``). Matched as bare substrings they hit
+    innocent words — ``cal`` is inside ``cervical`` and ``apical`` — and drop
+    usable series. Word boundaries keep the abbreviations usable.
+    """
+    return re.search(rf"\b{re.escape(keyword.lower())}\b", text) is not None
+
+
 def _is_present(value: Any) -> bool:
     if value is None:
         return False

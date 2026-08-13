@@ -19,6 +19,8 @@ import nibabel as nib
 import numpy as np
 import SimpleITK as sitk
 
+from .validation import OUTPUT_FORMATS
+
 logger = logging.getLogger(__name__)
 
 NIFTI_SUFFIXES = (".nii", ".nii.gz")
@@ -96,6 +98,25 @@ def _load_path(
     # Last resort: let nibabel try (handles .mgz, .hdr/.img, .mnc, ...).
     image = nib.load(path)
     return nib.Nifti1Image(np.asanyarray(image.dataobj), image.affine, None)
+
+
+def is_dicom_directory(path: str) -> bool:
+    """True for a directory of DICOM slices, i.e. one series rather than a cohort.
+
+    Only the files directly inside `path` are examined, which is what separates
+    a single series from a directory of per-case subdirectories.
+    """
+    try:
+        entries = sorted(os.listdir(path))
+    except OSError:
+        return False
+    for name in entries[:50]:
+        candidate = os.path.join(path, name)
+        if os.path.isfile(candidate) and (
+            name.lower().endswith((".dcm", ".ima")) or _looks_like_dicom(candidate)
+        ):
+            return True
+    return False
 
 
 def _looks_like_dicom(path: str) -> bool:
@@ -292,6 +313,7 @@ def save_image(
     Returns the path actually written, which may differ from `path` if the
     extension had to be adjusted for `output_format`.
     """
+    _check_output_format(output_format)
     path = resolve_output_path(path, output_format=output_format, compress=compress)
     parent = os.path.dirname(os.path.abspath(path))
     os.makedirs(parent, exist_ok=True)
@@ -305,6 +327,7 @@ def save_image(
 
 def resolve_output_path(path: str, output_format: str = "nifti", compress: bool = True) -> str:
     """Give `path` the extension implied by `output_format`."""
+    _check_output_format(output_format)
     lower = path.lower()
     if output_format in ("numpy", "npy"):
         if lower.endswith(".npy"):
@@ -317,8 +340,25 @@ def resolve_output_path(path: str, output_format: str = "nifti", compress: bool 
     return _strip_image_suffix(path) + wanted
 
 
+def _check_output_format(output_format: str) -> None:
+    """Reject a format we cannot write, rather than defaulting to NIfTI.
+
+    Notably ``"dicom"``: DICOM is read-only here. A clipped, resampled,
+    z-scored volume is no longer the acquisition the headers describe, so
+    writing it back as DICOM would produce files that misrepresent
+    themselves.
+    """
+    if output_format not in OUTPUT_FORMATS:
+        raise ValueError(
+            f"output_format must be one of {', '.join(OUTPUT_FORMATS)}, got "
+            f"{output_format!r}."
+            + (" DICOM output is not supported; ctkit reads DICOM but writes "
+               "NIfTI or .npy." if "dicom" in output_format.lower() else "")
+        )
+
+
 def _strip_image_suffix(path: str) -> str:
-    for suffix in (".nii.gz", ".nii", ".npy", ".npz"):
+    for suffix in (".nii.gz", ".nii", ".npy", ".npz", ".dcm", ".dicom", ".ima"):
         if path.lower().endswith(suffix):
             return path[: -len(suffix)]
     return path

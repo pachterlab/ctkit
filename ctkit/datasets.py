@@ -1,4 +1,4 @@
-"""The catalogue of datasets this package knows how to fetch and process.
+"""The catalog of datasets this package knows how to fetch and process.
 
 Two groups:
 
@@ -146,18 +146,18 @@ SUPPLEMENTARY_DOWNLOADS = {
 
 
 def all_datasets() -> dict:
-    """Every catalogued dataset, keyed by its short name."""
-    catalogue = {}
+    """Every cataloged dataset, keyed by its short name."""
+    catalog = {}
     for key, info in tcia_dataset_to_info.items():
         entry = dict(info)
         entry.setdefault("collection", key.upper())
         entry.setdefault("curated", True)
-        catalogue[key] = entry
+        catalog[key] = entry
     for key, info in EXTRA_CT_COLLECTIONS.items():
         entry = dict(info)
         entry.setdefault("curated", False)
-        catalogue[key] = entry
-    return catalogue
+        catalog[key] = entry
+    return catalog
 
 
 def normalize_name(name: str) -> str:
@@ -167,20 +167,20 @@ def normalize_name(name: str) -> str:
 
 def get_dataset_info(name: str) -> dict:
     """Look up one dataset. Raises :class:`KeyError` with suggestions."""
-    catalogue = all_datasets()
+    catalog = all_datasets()
     key = normalize_name(name)
-    if key in catalogue:
-        return {"name": key, **catalogue[key]}
+    if key in catalog:
+        return {"name": key, **catalog[key]}
 
     # Allow the TCIA collection name itself, e.g. "NSCLC-Radiomics".
-    for candidate, info in catalogue.items():
+    for candidate, info in catalog.items():
         if normalize_name(info.get("collection", candidate)) == key:
             return {"name": candidate, **info}
 
-    close = [candidate for candidate in catalogue if key in candidate or candidate in key]
+    close = [candidate for candidate in catalog if key in candidate or candidate in key]
     hint = f" Did you mean: {', '.join(sorted(close))}?" if close else ""
     raise KeyError(
-        f"Unknown dataset {name!r}.{hint} Use list_datasets() to see the catalogue, "
+        f"Unknown dataset {name!r}.{hint} Use list_datasets() to see the catalog, "
         "or pass any TCIA collection name directly to download()."
     )
 
@@ -194,7 +194,7 @@ def collection_for(name: str) -> str:
 
 
 def list_datasets(project: Optional[str] = None):
-    """The catalogue as a DataFrame: name, collection, organ, cancer type."""
+    """The catalog as a DataFrame: name, collection, organ, cancer type."""
     import pandas as pd
 
     rows = []

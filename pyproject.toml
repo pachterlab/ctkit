@@ -46,7 +46,8 @@ dependencies = [
     "scipy",
     "simpleitk",
     "pyyaml",
-    "openpyxl"
+    "openpyxl",
+    "pydantic>=2"
 ]
 
 [project.optional-dependencies]
@@ -79,6 +80,11 @@ ctkit = "ctkit.cli:main"
 [tool.setuptools.packages.find]
 where = ["."]
 include = ["ctkit*"]
+
+# PEP 561: ship the annotations, so mypy and editors check calls into ctkit
+# instead of treating everything it returns as Any.
+[tool.setuptools.package-data]
+ctkit = ["py.typed"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

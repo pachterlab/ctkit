@@ -9,9 +9,11 @@ from __future__ import annotations
 import logging
 import os
 import tempfile
-from typing import TYPE_CHECKING, Any, Optional, Sequence, Union
+from typing import TYPE_CHECKING, Any, Optional, Union
 
 import numpy as np
+
+from .validation import Labels
 
 if TYPE_CHECKING:  # pragma: no cover - import only for type checkers
     from .image import RadiologyImage
@@ -46,7 +48,7 @@ def default_params(dimensionality: str = "3D") -> dict:
 
 def extract_features(
     image: Union["RadiologyImage", Any],
-    labels: Sequence[int] = (1, 2),
+    labels: Labels = (1, 2),
     params: Optional[Union[str, dict]] = None,
     mask: Optional[Any] = None,
     drop_diagnostics: bool = False,
@@ -110,7 +112,7 @@ def extract_features(
     return result
 
 
-def _merge_labels(radiology_image: "RadiologyImage", labels: Sequence[int]):
+def _merge_labels(radiology_image: "RadiologyImage", labels: Labels):
     """Collapse the requested labels into a single region valued 1."""
     from .io import nifti_to_sitk
 
